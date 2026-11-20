@@ -13387,6 +13387,7 @@ def run_optimization_background(
             max_wait = 120  # 2 minute timeout
             start = _time.time()
             finished = False
+            poll_delay = 0.005
             try:
                 while _time.time() - start < max_wait:
                     try:
@@ -13399,7 +13400,8 @@ def run_optimization_background(
                         finished = True
                         exit_code = -1
                         break
-                    _time.sleep(0.5)
+                    _time.sleep(poll_delay)
+                    poll_delay = min(poll_delay * 2, 0.05)
                 
                 if not finished:
                     log(f"  [worker] ⚠ Worker still running after {max_wait}s — killing PID {pid}", sess_uuid)
