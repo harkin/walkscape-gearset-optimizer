@@ -41,6 +41,21 @@ def _sanitize_for_json(obj):
     return obj
 
 
+def _full_gear_set_row(row) -> Dict[str, Any]:
+    slots = json.loads(row[3]) if row[3] else {}
+    return {
+        'id': row[0],
+        'session_uuid': row[1],
+        'name': row[2],
+        'slots_json': _sanitize_for_json(slots),
+        'export_string': row[4],
+        'is_optimized': bool(row[5]),
+        'created_at': row[6],
+        'updated_at': row[7],
+        'suggest_dismissed': bool(row[8]) if len(row) > 8 else False
+    }
+
+
 def _coin_num(x):
     """Normalize a coin value for price signals / aggregation while supporting
     decimals (partner may federate fractional coin prices). Rounds to 2 decimal
@@ -1037,22 +1052,69 @@ class DatabaseManager:
         if not self._persistent_conn:
             conn.close()
         
-        gear_sets = []
-        for row in rows:
-            slots = json.loads(row[3]) if row[3] else {}
-            gear_sets.append({
+        return [_full_gear_set_row(row) for row in rows]
+
+    def get_gear_set_summaries(self, session_uuid: str, limit: Optional[int] = None, offset: int = 0) -> list:
+        """Same rows and order as get_gear_sets, without slots_json and export_string."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        columns = "id, session_uuid, name, is_optimized, created_at, updated_at"
+        if limit is not None and limit > 0:
+            cursor.execute(f"""
+                SELECT {columns}
+                FROM gear_sets
+                WHERE session_uuid = ?
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+            """, (session_uuid, limit, offset))
+        else:
+            cursor.execute(f"""
+                SELECT {columns}
+                FROM gear_sets
+                WHERE session_uuid = ?
+                ORDER BY updated_at DESC
+            """, (session_uuid,))
+        rows = cursor.fetchall()
+        if not self._persistent_conn:
+            conn.close()
+        return [
+            {
                 'id': row[0],
                 'session_uuid': row[1],
                 'name': row[2],
-                'slots_json': _sanitize_for_json(slots),
-                'export_string': row[4],
-                'is_optimized': bool(row[5]),
-                'created_at': row[6],
-                'updated_at': row[7],
-                'suggest_dismissed': bool(row[8]) if len(row) > 8 else False
-            })
-        
-        return gear_sets
+                'is_optimized': bool(row[3]),
+                'created_at': row[4],
+                'updated_at': row[5],
+            }
+            for row in rows
+        ]
+
+    def get_gear_set_names(self, session_uuid: str) -> set:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM gear_sets WHERE session_uuid = ?", (session_uuid,))
+        names = {row[0] for row in cursor.fetchall()}
+        if not self._persistent_conn:
+            conn.close()
+        return names
+
+    def get_full_gear_set(self, session_uuid: str, gear_set_id: Optional[str] = None,
+                          name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """One gear set by id or by name, shaped exactly like a get_gear_sets row."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        column, value = ("id", gear_set_id) if gear_set_id is not None else ("name", name)
+        cursor.execute(f"""
+            SELECT id, session_uuid, name, slots_json, export_string, is_optimized, created_at, updated_at, suggest_dismissed
+            FROM gear_sets
+            WHERE session_uuid = ? AND {column} = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """, (session_uuid, value))
+        row = cursor.fetchone()
+        if not self._persistent_conn:
+            conn.close()
+        return _full_gear_set_row(row) if row else None
 
     def count_gear_sets(self, session_uuid: str) -> int:
         """Count gear sets for a session. Cheaper than get_gear_sets when the

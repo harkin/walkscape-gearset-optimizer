@@ -3062,20 +3062,9 @@ def get_gear_sets(uuid: str, response: Response, summary: bool = False, limit: O
     # setting it is safe and future-proofs against subdomain CDN setups.
     response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
 
-    gear_sets = get_db().get_gear_sets(uuid, limit=limit, offset=offset)
     if summary:
-        return [
-            {
-                "id": gs["id"],
-                "session_uuid": gs["session_uuid"],
-                "name": gs["name"],
-                "is_optimized": gs.get("is_optimized", False),
-                "created_at": gs["created_at"],
-                "updated_at": gs["updated_at"],
-            }
-            for gs in gear_sets
-        ]
-    return gear_sets
+        return get_db().get_gear_set_summaries(uuid, limit=limit, offset=offset)
+    return get_db().get_gear_sets(uuid, limit=limit, offset=offset)
 
 
 @app.get("/api/session/{uuid}/gearsets/{gearset_id}", response_model=GearSetResponse)
@@ -3089,10 +3078,9 @@ async def get_gear_set(uuid: str, gearset_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    gear_sets = get_db().get_gear_sets(uuid)
-    for gs in gear_sets:
-        if gs["id"] == gearset_id:
-            return gs
+    gs = get_db().get_full_gear_set(uuid, gear_set_id=gearset_id)
+    if gs is not None:
+        return gs
     raise HTTPException(status_code=404, detail="Gear set not found")
 
 
@@ -10206,6 +10194,7 @@ async def optimize_gearset_local_result(request: Request):
         if isinstance(saved, dict):
             if saved.get('id') is not None:
                 resp['gear_set_id'] = saved.get('id')
+                resp['gear_set'] = saved
             if saved.get('name') is not None:
                 resp['name'] = saved.get('name')
         return resp

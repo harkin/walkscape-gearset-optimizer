@@ -3293,7 +3293,7 @@ def save_result_to_db(response_data, session_uuid, db_path, sorting_priority, op
         gearset_name = f"{activity_name} - {date_str}{sort_str}"
         
         # Check for duplicate names
-        existing_names = {gs['name'] for gs in db.get_gear_sets(session_uuid)}
+        existing_names = db.get_gear_set_names(session_uuid)
         if gearset_name in existing_names:
             counter = 1
             while f"{gearset_name} ({counter})" in existing_names:
@@ -3447,38 +3447,36 @@ def save_result_to_db(response_data, session_uuid, db_path, sorting_priority, op
         )
         
         # Verify the save worked by reading it back
-        saved_gearsets = db.get_gear_sets(session_uuid)
-        saved_match = [gs for gs in saved_gearsets if gs['name'] == gearset_name]
-        if saved_match:
-            gs = saved_match[0]
+        gs = db.get_full_gear_set(session_uuid, name=gearset_name)
+        if gs is not None:
             saved_gearset = gs
             print(f"✓ Worker saved gearset to DB: {gearset_name}")
             print(f"  DB id: {gs['id']}, created_at: {gs['created_at']}, is_optimized: {gs['is_optimized']}")
         else:
             print(f"⚠ Worker called save_gear_set but gearset NOT found in DB after save!")
             print(f"  Expected name: {gearset_name}")
-            print(f"  All gearset names: {[gs['name'] for gs in saved_gearsets]}")
+            print(f"  All gearset names: {sorted(db.get_gear_set_names(session_uuid))}")
         
         # If there's a requirements warning, store it in the gearset metadata
         if response_data.get('requirements_warning'):
             # Update the gearset with the warning flag
             try:
-                gearsets = db.get_gear_sets(session_uuid)
-                for gs in gearsets:
-                    if gs['name'] == gearset_name:
-                        existing_slots = gs.get('slots_json', {})
-                        if isinstance(existing_slots, str):
-                            existing_slots = json.loads(existing_slots)
-                        existing_slots['_requirements_warning'] = True
-                        conn = db._get_connection()
-                        # Sanitize to prevent inf/nan from breaking JSON serialization
-                        from ui.database import _sanitize_for_json
-                        conn.execute(
-                            "UPDATE gear_sets SET slots_json = ? WHERE id = ? AND session_uuid = ?",
-                            (json.dumps(_sanitize_for_json(existing_slots)), gs['id'], session_uuid)
-                        )
-                        conn.commit()
-                        break
+                gs = db.get_full_gear_set(session_uuid, name=gearset_name)
+                if gs is not None:
+                    existing_slots = gs.get('slots_json', {})
+                    if isinstance(existing_slots, str):
+                        existing_slots = json.loads(existing_slots)
+                    existing_slots['_requirements_warning'] = True
+                    conn = db._get_connection()
+                    # Sanitize to prevent inf/nan from breaking JSON serialization
+                    from ui.database import _sanitize_for_json
+                    conn.execute(
+                        "UPDATE gear_sets SET slots_json = ? WHERE id = ? AND session_uuid = ?",
+                        (json.dumps(_sanitize_for_json(existing_slots)), gs['id'], session_uuid)
+                    )
+                    conn.commit()
+                    if saved_gearset is not None and saved_gearset['id'] == gs['id']:
+                        saved_gearset = {**saved_gearset, 'slots_json': existing_slots}
             except Exception as warn_err:
                 print(f"⚠ Failed to save requirements warning: {warn_err}")
         
