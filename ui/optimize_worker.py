@@ -3209,6 +3209,19 @@ def compute_tree_node_slot_alternatives(
     return {}, {}, {}
 
 
+_SAVE_CATALOG = None
+
+
+def _save_catalog():
+    # Built from static game data only; the slot dicts below reference its
+    # entries without mutating them.
+    global _SAVE_CATALOG
+    if _SAVE_CATALOG is None:
+        from ui.catalog import ItemCatalog
+        _SAVE_CATALOG = ItemCatalog()
+    return _SAVE_CATALOG
+
+
 def save_result_to_db(response_data, session_uuid, db_path, sorting_priority, opt_type):
     """Save optimization result directly to the database.
     
@@ -3308,8 +3321,7 @@ def save_result_to_db(response_data, session_uuid, db_path, sorting_priority, op
         
         if response_data.get('consumable'):
             consumable_info = response_data['consumable']
-            from ui.catalog import ItemCatalog
-            catalog = ItemCatalog()
+            catalog = _save_catalog()
             
             def find_in_catalog(obj, name, item_type=None):
                 if isinstance(obj, dict):
@@ -3359,9 +3371,7 @@ def save_result_to_db(response_data, session_uuid, db_path, sorting_priority, op
         
         if response_data.get('pet'):
             pet_info = response_data['pet']
-            from ui.catalog import ItemCatalog
-            if 'catalog' not in dir():
-                catalog = ItemCatalog()
+            catalog = _save_catalog()
             
             def find_in_catalog_local(obj, name, item_type=None):
                 if isinstance(obj, dict):
