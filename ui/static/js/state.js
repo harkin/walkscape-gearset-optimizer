@@ -1868,8 +1868,13 @@ class StateStore {
                 this._syncToBackend('ui.hidden_alternatives', null);
             }
 
-            // Notify subscribers
-            this._notifySubscribers('gearsets.current');
+            // A whole gearset loaded at once, so there's no burst of edits to wait out.
+            this.loadingWholeGearset = true;
+            try {
+                this._notifySubscribers('gearsets.current');
+            } finally {
+                this.loadingWholeGearset = false;
+            }
             this._notifySubscribers('gearsets.selectedId');
             this._notifySubscribers('gearsets.selectedName');
 
@@ -2210,7 +2215,13 @@ class StateStore {
 
             // Notify subscribers - only notify the overall current once
             // Don't notify individual slots as that would trigger parent notifications multiple times
-            this._notifySubscribers('gearsets.current');
+            // A whole gearset loaded at once, so there's no burst of edits to wait out.
+            this.loadingWholeGearset = true;
+            try {
+                this._notifySubscribers('gearsets.current');
+            } finally {
+                this.loadingWholeGearset = false;
+            }
             this._notifySubscribers('gearsets.selectedId');
             this._notifySubscribers('gearsets.selectedName');
 

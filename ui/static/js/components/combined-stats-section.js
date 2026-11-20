@@ -165,8 +165,10 @@ class CombinedStatsSection extends CollapsibleSection {
             // 20s+ stall (reported after the gear popup fix removed the freeze).
             // The comparison-mode slot-switch cache path above returns
             // synchronously (instant), so only the expensive recompute is
-            // debounced — the last gear state wins after clicks settle.
-            this._scheduleStatsRecalc();
+            // debounced — the last gear state wins after clicks settle. A
+            // whole gearset load is a single change, so it renders on the
+            // next tick, once the load has finished updating the store.
+            this._scheduleStatsRecalc(store.loadingWholeGearset ? 0 : 120);
         });
 
         // Also re-render when gearset2 changes or active slot switches (comparison mode)
@@ -277,12 +279,12 @@ class CombinedStatsSection extends CollapsibleSection {
      * running one full ~1s recompute per intermediate change. The trailing
      * edge fires so the final gear state is always the one rendered.
      */
-    _scheduleStatsRecalc() {
+    _scheduleStatsRecalc(delayMs = 120) {
         clearTimeout(this._statsRecalcTimer);
         this._statsRecalcTimer = setTimeout(() => {
             this._statsRecalcTimer = null;
             this._renderPreservingScroll();
-        }, 120);
+        }, delayMs);
     }
 
     /**
