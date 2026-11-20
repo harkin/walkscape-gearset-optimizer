@@ -930,54 +930,34 @@ class OptimizeButton extends Component {
         const autoEquip = window.settingsModal?.autoEquipOptimized;
 
         try {
-            // Reload gearsets to pick up the newly saved travel gearset
-            const freshGearSets = await $.get('/api/session/' + store.state.session.uuid + '/gearsets');
-            console.log('[TravelOpt] freshGearSets count:', freshGearSets.length);
-            console.log('[TravelOpt] taskKey:', taskKey);
-            store.state.gearsets.saved = {};
-            freshGearSets.forEach(gs => {
-                store.state.gearsets.saved[gs.id] = {
-                    name: gs.name,
-                    slots: gs.slots_json,
-                    export_string: gs.export_string,
-                    is_optimized: gs.is_optimized,
-                    created_at: gs.created_at,
-                };
-            });
-            store._notifySubscribers('gearsets.saved');
-
             // Find the travel gearset we just created by matching its name.
             // The backend names it "Travel: {Start} → {End}" derived from the task key.
             // We can't rely on recency because a previously-run activity optimization
             // (e.g. Basket Weaving) may have a newer created_at timestamp.
             let newGs = null;
             const parts = taskKey.split(':');
-            console.log('[TravelOpt] taskKey parts:', parts);
+            console.log('[TravelOpt] taskKey:', taskKey);
             // Task key shape is "simple:{start}:{end}" or "simple:{start}:{end}:{hash}"
             // when the popup flow adds a payload hash for uniqueness.
-            if (parts.length >= 3 && parts[0] === 'simple') {
-                const toTitle = s => s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-                const expectedName = `Travel: ${toTitle(parts[1])} \u2192 ${toTitle(parts[2])}`;
-                console.log('[TravelOpt] expectedName:', JSON.stringify(expectedName));
-                console.log('[TravelOpt] all gearset names:', freshGearSets.map(gs => JSON.stringify(gs.name)));
-                // Find by name among all gearsets (not just optimized), most recent first
-                const byName = freshGearSets
+            const isSimple = parts.length >= 3 && parts[0] === 'simple';
+            const toTitle = s => s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+            const expectedName = isSimple ? `Travel: ${toTitle(parts[1])} \u2192 ${toTitle(parts[2])}` : null;
+            const findByName = async () => {
+                const summaries = await $.get('/api/session/' + store.state.session.uuid + '/gearsets?summary=true');
+                const match = summaries
                     .filter(gs => gs.name === expectedName)
-                    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-                console.log('[TravelOpt] byName matches:', byName.length, byName.map(gs => gs.name));
-                newGs = byName[0] || null;
-                if (newGs) {
-                    // Helps verify the fix is healthy in the wild — when this
-                    // logs we know the named lookup hit on first try and the
-                    // re-fetch retry/error path was never needed.
-                    console.log('[TravelOpt] \u2713 FOUND on first try via name lookup:', {
-                        id: newGs.id,
-                        name: newGs.name,
-                        is_optimized: newGs.is_optimized,
-                        created_at: newGs.created_at,
-                        slot_keys: Object.keys(newGs.slots_json || {}).filter(k => !k.startsWith('_')),
-                    });
+                    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+                if (!match) {
+                    console.log('[TravelOpt] no gearset named', JSON.stringify(expectedName), 'among', summaries.length);
+                    return null;
                 }
+                const full = await $.get('/api/session/' + store.state.session.uuid + '/gearsets/' + match.id);
+                store.upsertSavedGearSet(full);
+                return full;
+            };
+            if (isSimple) {
+                newGs = await findByName();
+                if (newGs) console.log('[TravelOpt] \u2713 FOUND on first try via name lookup:', { id: newGs.id, name: newGs.name });
             }
             // Fallback: re-fetch once after a short delay in case the save
             // committed after our initial gearset list query (race condition).
@@ -989,52 +969,10 @@ class OptimizeButton extends Component {
                 console.log('[TravelOpt] Name lookup failed on first try; re-fetching gearsets after 750ms in case save was racy');
                 await new Promise(r => setTimeout(r, 750));
                 try {
-                    const refetched = await $.get('/api/session/' + store.state.session.uuid + '/gearsets');
-                    console.log('[TravelOpt] re-fetched gearsets count:', refetched.length);
-                    if (parts.length >= 3 && parts[0] === 'simple') {
-                        const toTitle = s => s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-                        const expectedName = `Travel: ${toTitle(parts[1])} \u2192 ${toTitle(parts[2])}`;
-                        const byName2 = refetched
-                            .filter(gs => gs.name === expectedName)
-                            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-                        console.log('[TravelOpt] re-fetch byName matches:', byName2.length);
-                        newGs = byName2[0] || null;
-                        if (newGs) {
-                            // Re-fetch hits indicate a real race between save
-                            // commit and gearset list query. If this fires
-                            // repeatedly in production logs we may want to
-                            // increase the 750ms delay or have the backend
-                            // commit synchronously before completing the task.
-                            console.log('[TravelOpt] \u2713 FOUND on re-fetch (race condition recovered):', {
-                                id: newGs.id,
-                                name: newGs.name,
-                                is_optimized: newGs.is_optimized,
-                                created_at: newGs.created_at,
-                                slot_keys: Object.keys(newGs.slots_json || {}).filter(k => !k.startsWith('_')),
-                            });
-                            // Refresh store cache too so the UI is in sync.
-                            store.state.gearsets.saved = {};
-                            refetched.forEach(gs => {
-                                store.state.gearsets.saved[gs.id] = {
-                                    name: gs.name,
-                                    slots: gs.slots_json,
-                                    export_string: gs.export_string,
-                                    is_optimized: gs.is_optimized,
-                                    created_at: gs.created_at,
-                                };
-                            });
-                            store._notifySubscribers('gearsets.saved');
-                        } else {
-                            // Loud signal that something is genuinely wrong —
-                            // either backend save failed or named differently.
-                            // Compare expectedName against all names in the
-                            // re-fetched list to make the mismatch obvious.
-                            console.warn('[TravelOpt] \u2717 Re-fetch did NOT find expected gearset', {
-                                expectedName,
-                                refetched_names: refetched.map(gs => gs.name).slice(0, 20),
-                                refetched_count: refetched.length,
-                            });
-                        }
+                    if (isSimple) {
+                        newGs = await findByName();
+                        if (newGs) console.log('[TravelOpt] \u2713 FOUND on re-fetch (race condition recovered):', { id: newGs.id, name: newGs.name });
+                        else console.warn('[TravelOpt] \u2717 Re-fetch did NOT find expected gearset', { expectedName });
                     }
                 } catch (refetchErr) {
                     console.error('[TravelOpt] re-fetch failed:', refetchErr);
@@ -4308,8 +4246,11 @@ class OptimizeButton extends Component {
                         let handled = false;
                         if (savedId) {
                             try {
-                                const gearSets = await $.get('/api/session/' + store.state.session.uuid + '/gearsets');
-                                const savedGs = (gearSets || []).find(gs => gs.id === savedId);
+                                let savedGs = localSaveResp.gear_set;
+                                if (!savedGs || savedGs.id !== savedId) {
+                                    const gearSets = await $.get('/api/session/' + store.state.session.uuid + '/gearsets');
+                                    savedGs = (gearSets || []).find(gs => gs.id === savedId);
+                                }
                                 if (savedGs) {
                                     await this._handleOptimizationResult(savedGs, this._optimizingSlot);
                                     handled = true;
@@ -4530,7 +4471,7 @@ class OptimizeButton extends Component {
         // The core check: look for a new optimized gearset and handle it
         const checkForResult = async () => {
             try {
-                const response = await $.get('/api/session/' + store.state.session.uuid + '/gearsets');
+                const response = await $.get('/api/session/' + store.state.session.uuid + '/gearsets?summary=true');
                 // Primary filter: gearset must not have been known when polling started.
                 // This prevents picking up a previous optimization's result when two
                 // optimizations run in quick succession (the 10s time buffer was too wide).
@@ -4543,8 +4484,9 @@ class OptimizeButton extends Component {
 
                 if (newGs) {
                     console.log('✓ New optimized gearset detected:', newGs.name, 'id:', newGs.id, 'for slot:', capturedSlot);
+                    const fullGs = await $.get('/api/session/' + store.state.session.uuid + '/gearsets/' + newGs.id);
                     stop();
-                    await this._handleOptimizationResult(newGs, capturedSlot);
+                    await this._handleOptimizationResult(fullGs, capturedSlot);
                     return true;
                 }
 
@@ -4573,12 +4515,12 @@ class OptimizeButton extends Component {
                 if (event.data === 'done' || event.data === 'timeout') {
                     sse.close();
                     this._sseSource = null;
-                    // Give DB a moment to commit, then check with retries
-                    // The worker may have just finished — SQLite needs a moment
-                    // to make the committed data visible to new connections
+                    // The worker commits before it exits and 'done' is only sent
+                    // after the exit, so check at once; the retries keep the same
+                    // last-attempt time as a safety net.
                     let found = false;
                     for (let attempt = 0; attempt < 3 && !found && !stopped; attempt++) {
-                        await new Promise(r => setTimeout(r, attempt === 0 ? 200 : 500));
+                        if (attempt > 0) await new Promise(r => setTimeout(r, attempt === 1 ? 700 : 500));
                         found = await checkForResult();
                     }
                     if (!found && !stopped) {
@@ -4675,6 +4617,28 @@ class OptimizeButton extends Component {
     }
 
     /**
+     * Put an optimized gearset into the saved list, refetching the list only
+     * when the gearset arrived without its slots and export string.
+     */
+    async _storeOptimizedGearset(gearset) {
+        if (gearset.slots_json !== undefined && gearset.export_string !== undefined) {
+            store.upsertSavedGearSet(gearset);
+            return;
+        }
+        const freshGearSets = await $.get('/api/session/' + store.state.session.uuid + '/gearsets');
+        store.state.gearsets.saved = {};
+        freshGearSets.forEach(gs => {
+            store.state.gearsets.saved[gs.id] = {
+                name: gs.name,
+                slots: gs.slots_json,
+                export_string: gs.export_string,
+                is_optimized: gs.is_optimized
+            };
+        });
+        store._notifySubscribers('gearsets.saved');
+    }
+
+    /**
      * Handle a detected optimization result (shared by SSE and polling paths)
      */
     async _handleOptimizationResult(gearset, capturedSlot = null) {
@@ -4745,33 +4709,13 @@ class OptimizeButton extends Component {
             // Triggered from popup's "Optimize Slot & Equip" — the popup handles
             // equipping and re-rendering itself, so just refresh gearsets silently
             try {
-                const freshGearSets = await $.get('/api/session/' + store.state.session.uuid + '/gearsets');
-                store.state.gearsets.saved = {};
-                freshGearSets.forEach(gs => {
-                    store.state.gearsets.saved[gs.id] = {
-                        name: gs.name,
-                        slots: gs.slots_json,
-                        export_string: gs.export_string,
-                        is_optimized: gs.is_optimized
-                    };
-                });
-                store._notifySubscribers('gearsets.saved');
+                await this._storeOptimizedGearset(gearset);
             } catch (e) {
                 console.error('Failed to reload gearsets for slot optimization:', e);
             }
         } else if (autoEquip || targetSlot) {
             try {
-                const freshGearSets = await $.get('/api/session/' + store.state.session.uuid + '/gearsets');
-                store.state.gearsets.saved = {};
-                freshGearSets.forEach(gs => {
-                    store.state.gearsets.saved[gs.id] = {
-                        name: gs.name,
-                        slots: gs.slots_json,
-                        export_string: gs.export_string,
-                        is_optimized: gs.is_optimized
-                    };
-                });
-                store._notifySubscribers('gearsets.saved');
+                await this._storeOptimizedGearset(gearset);
 
                 // In comparison mode, equip to the target slot
                 if (targetSlot === 2) {
@@ -4789,6 +4733,11 @@ class OptimizeButton extends Component {
                 api.showSuccess(`Optimization complete! Equipped${slotLabel}: ${gearset.name}`, { duration: 5000 });
             }
         } else {
+            try {
+                await this._storeOptimizedGearset(gearset);
+            } catch (e) {
+                console.error('Failed to store the optimized gearset:', e);
+            }
             this.optimizedGearsetId = gearset.id;
             this.showEquipButton = true;
 
@@ -4799,11 +4748,8 @@ class OptimizeButton extends Component {
                 const toastHtml = `Optimization complete! Saved: ${gearset.name}<br><span style="opacity:0.8;font-size:0.9em;">Click to equip optimized gear set</span>`;
                 api.showSuccess(null, { html: toastHtml, duration: 10000, onClick: () => this.equipOptimizedGearset() });
             }
-            // Refresh saved gearsets list (auto-equip path already refreshed above)
-            store._loadGearSets(store.state.session.uuid);
         }
 
-        // Gearsets already refreshed above during auto-equip
         this.isOptimizing = false;
         store._skipGearset2Copy = false;
         this.render();

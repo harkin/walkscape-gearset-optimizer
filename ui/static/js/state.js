@@ -1732,6 +1732,34 @@ class StateStore {
     }
 
     /**
+     * Put one full gearset (as returned by the gearsets API) at the top of
+     * the saved list, the position a refetch ordered by updated_at would give it.
+     */
+    upsertSavedGearSet(gs) {
+        const gearsets = this.state.gearsets;
+        const isNew = !(gs.id in (gearsets.saved || {}));
+        const saved = {
+            [gs.id]: {
+                name: gs.name,
+                slots: gs.slots_json,
+                export_string: gs.export_string,
+                is_optimized: gs.is_optimized,
+                suggestDismissed: gs.suggest_dismissed,
+                _summary_only: false,
+            },
+        };
+        for (const [id, entry] of Object.entries(gearsets.saved || {})) {
+            if (id !== gs.id) saved[id] = entry;
+        }
+        gearsets.saved = saved;
+        if (isNew) {
+            if (typeof gearsets.totalCount === 'number') gearsets.totalCount++;
+            if (typeof gearsets.loadedCount === 'number') gearsets.loadedCount++;
+        }
+        this._notifySubscribers('gearsets.saved');
+    }
+
+    /**
      * Load a saved gear set into current gear
      * @param {string} id - Gear set ID
      */
