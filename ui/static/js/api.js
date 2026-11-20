@@ -12,6 +12,26 @@ class ApiClient {
         this.baseUrl = '/api';
         this._catalogCache = null;
         this._catalogPromise = null;
+        this._gameDataText = new Map();
+    }
+
+    /**
+     * GET a game-data endpoint (/api/activities, /api/recipes, /api/services,
+     * /api/locations). The text is fetched once per page; each call parses
+     * its own copy, so callers can change what they get without affecting
+     * each other. /api/activities' drop rates depend on the character's skill
+     * levels, which can change within a page, so read only its static fields
+     * (names, skills, requirements) through this.
+     * @returns {Promise} resolves with the parsed response
+     */
+    getGameData(path) {
+        let text = this._gameDataText.get(path);
+        if (!text) {
+            text = Promise.resolve($.ajax({ url: path, dataType: 'text' }));
+            text.catch(() => this._gameDataText.delete(path));
+            this._gameDataText.set(path, text);
+        }
+        return text.then((body) => JSON.parse(body));
     }
 
     /**

@@ -137,7 +137,7 @@ class RecipeInfoSection extends Component {
                     const savedLocation = store.state.column3?.selectedLocation;
 
                     try {
-                        const svcResponse = await $.get('/api/services');
+                        const svcResponse = await api.getGameData('/api/services');
                         const skill = (data.skill || '').toLowerCase();
                         const skillServices = (svcResponse.services || []).filter(svc =>
                             (svc.category || '').toLowerCase() === skill
@@ -208,7 +208,7 @@ class RecipeInfoSection extends Component {
             // Use cached recipes data from the dropdown instead of re-fetching
             const recipeDropdown = window.recipeSelector;
             const cachedData = recipeDropdown?.recipesData;
-            const response = cachedData || await $.get('/api/recipes');
+            const response = cachedData || await api.getGameData('/api/recipes');
 
             // Find recipe by ID
             for (const recipes of Object.values(response.by_skill)) {
@@ -311,7 +311,7 @@ class RecipeInfoSection extends Component {
                 // render(), which uses loc.regions || [loc.id].
                 let locRegions = [this.selectedLocation];
                 try {
-                    const locResp = await $.get('/api/locations');
+                    const locResp = await api.getGameData('/api/locations');
                     for (const region of locResp.regions || []) {
                         const loc = (region.locations || []).find(l => l.id === this.selectedLocation);
                         if (loc) {
@@ -568,7 +568,7 @@ class RecipeInfoSection extends Component {
                 const isGenericRecipe = this.recipe.id && String(this.recipe.id).startsWith('generic::');
                 let service = null;
                 if (isGenericRecipe) {
-                    const response = await $.get('/api/services');
+                    const response = await api.getGameData('/api/services');
                     const allServices = response.services || [];
                     // Find all location-specific services matching this grouped service name
                     const grouped = allServices.find(s => s.id === serviceId);
@@ -699,7 +699,7 @@ class RecipeInfoSection extends Component {
             let locRegions = [locationId];
             let regionNames = [];
             try {
-                const locResp = await $.get('/api/locations');
+                const locResp = await api.getGameData('/api/locations');
                 const regions = locResp.regions || [];
                 for (const region of regions) {
                     const loc = (region.locations || []).find(l => l.id === locationId);
@@ -2062,7 +2062,7 @@ class RecipeInfoSection extends Component {
         // For generic recipes, load all services for the skill category
         if (this.recipe.id && String(this.recipe.id).startsWith('generic::')) {
             try {
-                const response = await $.get('/api/services');
+                const response = await api.getGameData('/api/services');
                 const skill = (this.recipe.skill || '').toLowerCase();
                 const allServices = response.services || [];
                 // Filter services by skill category
@@ -2261,7 +2261,7 @@ class RecipeInfoSection extends Component {
 
                     // Try to get proper icon from locations API
                     try {
-                        const locsResponse = await $.get('/api/locations');
+                        const locsResponse = await api.getGameData('/api/locations');
                         if (locsResponse && locsResponse.regions) {
                             // Flatten all locations from all regions
                             const allLocs = locsResponse.regions.flatMap(r => r.locations || []);
@@ -2296,7 +2296,7 @@ class RecipeInfoSection extends Component {
             let response;
             if (this.recipe.id && String(this.recipe.id).startsWith('generic::')) {
                 // For generic recipes, build grouped response from flat services
-                const allSvcs = await $.get('/api/services');
+                const allSvcs = await api.getGameData('/api/services');
                 const flat = allSvcs.services || [];
 
                 // Group by name+tier to build locations arrays

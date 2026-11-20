@@ -389,7 +389,7 @@ class CombinedStatsSection extends CollapsibleSection {
         if (activityId) {
             try {
                 // Try activities first
-                const actResponse = await $.get('/api/activities');
+                const actResponse = await api.getGameData('/api/activities');
                 for (const activities of Object.values(actResponse.by_skill)) {
                     const activity = activities.find(a => a.id === activityId);
                     if (activity) {
@@ -409,7 +409,7 @@ class CombinedStatsSection extends CollapsibleSection {
 
                 // If not found in activities, try recipes
                 if (!isActivity) {
-                    const recResponse = await $.get('/api/recipes');
+                    const recResponse = await api.getGameData('/api/recipes');
                     for (const recipes of Object.values(recResponse.by_skill)) {
                         const recipe = recipes.find(r => r.id === activityId);
                         if (recipe) {
@@ -531,7 +531,7 @@ class CombinedStatsSection extends CollapsibleSection {
 
                 try {
                     // Try activities first
-                    const actResponse = await $.get('/api/activities');
+                    const actResponse = await api.getGameData('/api/activities');
                     let found = false;
                     for (const activities of Object.values(actResponse.by_skill)) {
                         const activity = activities.find(a => a.id === activityId);
@@ -553,7 +553,7 @@ class CombinedStatsSection extends CollapsibleSection {
                         this.isTravel = false;
                         this.currentActivityComponentSkills = null;
                         this.currentRequiredKeywords = [];
-                        const recResponse = await $.get('/api/recipes');
+                        const recResponse = await api.getGameData('/api/recipes');
                         for (const recipes of Object.values(recResponse.by_skill)) {
                             const recipe = recipes.find(r => r.id === activityId);
                             if (recipe) {
@@ -752,7 +752,7 @@ class CombinedStatsSection extends CollapsibleSection {
                 }
             }
             if (!regions) {
-                const locResp = await $.get('/api/locations');
+                const locResp = await api.getGameData('/api/locations');
                 for (const region of locResp.regions || []) {
                     const loc = (region.locations || []).find(l => l.id === locId);
                     if (loc) {
@@ -886,7 +886,7 @@ class CombinedStatsSection extends CollapsibleSection {
                 }
             } else {
                 try {
-                    const recResponse = await $.get('/api/recipes');
+                    const recResponse = await api.getGameData('/api/recipes');
                     for (const recipes of Object.values(recResponse.by_skill)) {
                         const recipe = recipes.find(r => r.id === recipeId);
                         if (recipe) {
@@ -936,7 +936,7 @@ class CombinedStatsSection extends CollapsibleSection {
     async _getServiceRequiredKeywords(serviceId) {
         if (!serviceId) return [];
         try {
-            const serviceResponse = await $.get('/api/services');
+            const serviceResponse = await api.getGameData('/api/services');
             // Find service by ID or by location service_id
             let service = serviceResponse.services.find(s => s.id === serviceId);
             if (!service) {
@@ -1840,7 +1840,7 @@ class CombinedStatsSection extends CollapsibleSection {
                         // Fetch wiki service details
                         let serviceResponse;
                         if (this.currentRecipe.startsWith('generic::')) {
-                            const allSvcs = await $.get('/api/services');
+                            const allSvcs = await api.getGameData('/api/services');
                             serviceResponse = { services: allSvcs.services || [] };
                         } else {
                             serviceResponse = await $.get(`/api/services/for-recipe/${this.currentRecipe}`);
@@ -2106,7 +2106,7 @@ class CombinedStatsSection extends CollapsibleSection {
                         console.error('Failed to load generic activity for level bonus:', e);
                     }
                 } else {
-                    const response = await $.get('/api/activities');
+                    const response = await api.getGameData('/api/activities');
                     for (const activities of Object.values(response.by_skill)) {
                         activity = activities.find(a => a.id === selectedActivity);
                         if (activity) break;
@@ -2162,7 +2162,7 @@ class CombinedStatsSection extends CollapsibleSection {
                         console.error('Failed to load generic recipe for level bonus:', e);
                     }
                 } else {
-                    const response = await $.get('/api/recipes');
+                    const response = await api.getGameData('/api/recipes');
                     for (const recipes of Object.values(response.by_skill)) {
                         recipe = recipes.find(r => r.id === selectedRecipe);
                         if (recipe) break;
@@ -2888,7 +2888,7 @@ class CombinedStatsSection extends CollapsibleSection {
         if (this._locationRegionsMap) return this._locationRegionsMap;
         const map = {};
         try {
-            const resp = await $.get('/api/locations');
+            const resp = await api.getGameData('/api/locations');
             for (const region of (resp.regions || [])) {
                 for (const loc of (region.locations || [])) {
                     if (!loc || !loc.id) continue;
