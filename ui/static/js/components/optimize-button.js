@@ -4472,6 +4472,7 @@ class OptimizeButton extends Component {
         const checkForResult = async () => {
             try {
                 const response = await $.get('/api/session/' + store.state.session.uuid + '/gearsets?summary=true');
+                if (stopped) return true;
                 // Primary filter: gearset must not have been known when polling started.
                 // This prevents picking up a previous optimization's result when two
                 // optimizations run in quick succession (the 10s time buffer was too wide).
@@ -4485,6 +4486,8 @@ class OptimizeButton extends Component {
                 if (newGs) {
                     console.log('✓ New optimized gearset detected:', newGs.name, 'id:', newGs.id, 'for slot:', capturedSlot);
                     const fullGs = await $.get('/api/session/' + store.state.session.uuid + '/gearsets/' + newGs.id);
+                    // The SSE and polling checks can overlap; only the first claims the result.
+                    if (stopped) return true;
                     stop();
                     await this._handleOptimizationResult(fullGs, capturedSlot);
                     return true;
