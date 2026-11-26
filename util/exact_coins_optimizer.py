@@ -90,7 +90,7 @@ class ExactCoinsOptimizer(ExactGearsetOptimizer):
                 if not hasattr(it, "get_stats_for_skill"):
                     continue
                 try:
-                    st = it.get_stats_for_skill(skill=skill, location=location, character=character)
+                    st = self._get_item_stats(it, skill, location, character)
                 except Exception:
                     continue
                 for k in st:

@@ -105,7 +105,7 @@ class ExactTargetRateOptimizer(ExactCoinsOptimizer):
                 if not hasattr(it, "get_stats_for_skill"):
                     continue
                 try:
-                    st = it.get_stats_for_skill(skill=skill, location=location, character=character)
+                    st = self._get_item_stats(it, skill, location, character)
                 except Exception:
                     continue
                 for key in st:
@@ -183,7 +183,7 @@ class ExactCurrencyValueOptimizer(ExactCoinsOptimizer):
                 if not hasattr(it, "get_stats_for_skill"):
                     continue
                 try:
-                    st = it.get_stats_for_skill(skill=skill, location=location, character=character)
+                    st = self._get_item_stats(it, skill, location, character)
                 except Exception:
                     continue
                 for key in st:
@@ -277,7 +277,7 @@ class ExactFineRateOptimizer(ExactTargetRateOptimizer):
                 if not hasattr(it, "get_stats_for_skill"):
                     continue
                 try:
-                    st = it.get_stats_for_skill(skill=skill, location=location, character=character)
+                    st = self._get_item_stats(it, skill, location, character)
                 except Exception:
                     continue
                 for key in st:
