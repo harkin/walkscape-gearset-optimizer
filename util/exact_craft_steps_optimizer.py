@@ -140,16 +140,19 @@ class ExactCraftStepsOptimizer(ExactGearsetOptimizer):
         # across recipes/qualities. Equivalence-gated by
         # tests/test_fastest_craft_frontier_cache_equivalence.py.
         self._qp_cache = {}
-        # Axis model: base step axes + double_rewards / no_materials_consumed.
-        # The quality_outcome ('qo') axis is included ONLY for quality-target
-        # nodes (root equipment). For material nodes quality_prob==1, so 'qo'
-        # has zero effect on the objective and would only inflate the B&B
-        # Pareto frontier (a pure plateau-expander) — drop it there.
-        base_axes = ["W", "S_add", "S_pct", "B", "dr", "nmc"]
-        base_max = ["W", "B", "dr", "nmc"]
+        # Axis model: base step axes + double_rewards, plus no_materials_consumed
+        # only when downstream materials exist (m0 > 0) and quality_outcome only
+        # for quality-target nodes (root equipment). Dropping inert axes shrinks
+        # Pareto frontiers with zero impact on the objective.
+        base_axes = ["W", "S_add", "S_pct", "B", "dr"]
+        base_max = ["W", "B", "dr"]
         axis_map = {"work_efficiency": "W", "steps_add": "S_add",
                     "steps_percent": "S_pct", "double_action": "B",
-                    "double_rewards": "dr", "no_materials_consumed": "nmc"}
+                    "double_rewards": "dr"}
+        if self._mat_per_output0 > 0.0:
+            base_axes.append("nmc")
+            base_max.append("nmc")
+            axis_map["no_materials_consumed"] = "nmc"
         if self._apply_quality:
             base_axes.append("qo")
             base_max.append("qo")
@@ -159,7 +162,8 @@ class ExactCraftStepsOptimizer(ExactGearsetOptimizer):
         self.MIN_AXES = ("S_add", "S_pct")
         self.CAP_AXIS = "W"
         self.AXIS_MAP = axis_map
-        self._MITM_ENABLED = False   # custom objective — pure B&B only.
+        self._MITM_ENABLED = True
+        self._MITM_VALIDATE = False
 
     # ── quality helper ────────────────────────────────────────────────────
     def _qp(self, qo_axis):
@@ -212,6 +216,231 @@ class ExactCraftStepsOptimizer(ExactGearsetOptimizer):
         if self._mat_per_output0 > 0.0:
             caps["nmc"] = 0.99
         return caps
+
+    def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
+        """Inlined KD-blocked upper-bound-pruned MITM combine for craft steps.
+        Proves global optimality without hitting B&B node budgets."""
+        AXES = self.AXES
+        nax = len(AXES)
+        s0 = {a: float(base_stats.get(a, 0.)) for a in AXES}
+        s0v = tuple(s0[a] for a in AXES)
+        iW = AXES.index("W"); iSa = AXES.index("S_add")
+        iSp = AXES.index("S_pct"); iB = AXES.index("B"); idr = AXES.index("dr")
+        has_nmc = "nmc" in AXES
+        inmc = AXES.index("nmc") if has_nmc else -1
+        has_qo = self._apply_quality and ("qo" in AXES)
+        iqo = AXES.index("qo") if has_qo else -1
+
+        max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
+        min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
+        rk = tuple(reqs)
+        nrk = len(rk)
+        req_caps = tuple(reqs[k] for k in rk)
+        has_reqs = nrk > 0
+        rng = range(nax)
+
+        oq_inv = 1.0 / self._oq_plus_if
+        mat0 = self._mat_per_output0
+        step_floor = self.STEP_FLOOR
+        _ceil = math.ceil
+        _qp = self._qp
+        qp_peak400 = _qp(400.0 - self._level_bonus_qo) if has_qo else 1.0
+        lb_qo = self._level_bonus_qo
+
+        def _extract(fr):
+            out = []
+            for st in fr:
+                vt = st.get("vt")
+                if vt is None:
+                    v = st["v"]
+                    vt = tuple(v[a] for a in AXES)
+                kwt = st.get("kwt")
+                if kwt is None:
+                    kw = st["kw"]
+                    kwt = tuple(kw[k] for k in rk) if has_reqs else ()
+                comp = st["comp"]
+                out.append((vt, kwt, -len(comp), st.get("tb", 0.0), comp))
+            return out
+
+        FGv = _extract(FG)
+        FAv = _extract(FA)
+        if not FGv or not FAv:
+            return float("-inf"), None, None
+
+        if has_reqs:
+            max_kwA = tuple(max(x[1][j] for x in FAv) for j in range(nrk))
+            FGv = [x for x in FGv if all(x[1][j] + max_kwA[j] >= req_caps[j] for j in range(nrk))]
+            if not FGv:
+                return float("-inf"), None, None
+            max_kwG = tuple(max(x[1][j] for x in FGv) for j in range(nrk))
+            FAv = [x for x in FAv if all(x[1][j] + max_kwG[j] >= req_caps[j] for j in range(nrk))]
+            if not FAv:
+                return float("-inf"), None, None
+
+        # Global bounding boxes
+        boxA = [0.0] * nax
+        boxG = [0.0] * nax
+        for j in max_idxs:
+            boxA[j] = max(x[0][j] for x in FAv)
+            boxG[j] = max(x[0][j] for x in FGv)
+        for j in min_idxs:
+            boxA[j] = min(x[0][j] for x in FAv)
+            boxG[j] = min(x[0][j] for x in FGv)
+
+        step_cache = {}
+        def _steps_base(w, sa, sp, b):
+            key = (w, sa, sp, b)
+            st = step_cache.get(key)
+            if st is None:
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
+                st = (stp / (1.0 + b)) * oq_inv
+                step_cache[key] = st
+            return st
+
+        def _eval_ub(w, sa, sp, b, dr, nmc, qo):
+            dr_c = 1.0 if dr > 1.0 else (0.0 if dr < 0.0 else dr)
+            if has_qo:
+                p = _qp(qo)
+                if qo + lb_qo > 400.0 and qp_peak400 > p:
+                    p = qp_peak400
+                num = (1.0 + dr_c) * p
+            else:
+                num = 1.0 + dr_c
+            st = _steps_base(w, sa, sp, b)
+            if has_nmc:
+                nmc_c = 0.99 if nmc > 0.99 else (0.0 if nmc < 0.0 else nmc)
+                st += (1.0 - nmc_c) * mat0
+            return num / st
+
+        s0W = s0v[iW]; s0Sa = s0v[iSa]; s0Sp = s0v[iSp]; s0B = s0v[iB]; s0dr = s0v[idr]
+        s0nmc = s0v[inmc] if has_nmc else 0.0
+        s0qo = s0v[iqo] if has_qo else 0.0
+
+        bAW = boxA[iW]; bASa = boxA[iSa]; bASp = boxA[iSp]; bAB = boxA[iB]; bAdr = boxA[idr]
+        bAnmc = boxA[inmc] if has_nmc else 0.0
+        bAqo = boxA[iqo] if has_qo else 0.0
+        bGW = boxG[iW]; bGSa = boxG[iSa]; bGSp = boxG[iSp]; bGB = boxG[iB]; bGdr = boxG[idr]
+        bGnmc = boxG[inmc] if has_nmc else 0.0
+        bGqo = boxG[iqo] if has_qo else 0.0
+
+        FG_ub = []
+        for x in FGv:
+            vt = x[0]
+            ub = _eval_ub(s0W + vt[iW] + bAW, s0Sa + vt[iSa] + bASa,
+                          s0Sp + vt[iSp] + bASp, s0B + vt[iB] + bAB,
+                          s0dr + vt[idr] + bAdr,
+                          (s0nmc + vt[inmc] + bAnmc) if has_nmc else 0.0,
+                          (s0qo + vt[iqo] + bAqo) if has_qo else 0.0)
+            FG_ub.append((*x, ub))
+        FA_ub = []
+        for x in FAv:
+            vt = x[0]
+            ub = _eval_ub(s0W + bGW + vt[iW], s0Sa + bGSa + vt[iSa],
+                          s0Sp + bGSp + vt[iSp], s0B + bGB + vt[iB],
+                          s0dr + bGdr + vt[idr],
+                          (s0nmc + bGnmc + vt[inmc]) if has_nmc else 0.0,
+                          (s0qo + bGqo + vt[iqo]) if has_qo else 0.0)
+            FA_ub.append((*x, ub))
+
+        FG_ub.sort(key=lambda x: x[5], reverse=True)
+        FA_ub.sort(key=lambda x: x[5], reverse=True)
+
+        best_r = float("-inf"); best_tb = float("-inf"); best_nfill = float("-inf")
+        best_load = None; best_gv = None; best_av = None
+
+        # Quick seed from top-16 x top-16
+        for gv, kG, nfG, tbG, cG, _ in FG_ub[:16]:
+            gW = s0W + gv[iW]; gSa = s0Sa + gv[iSa]; gSp = s0Sp + gv[iSp]
+            gB = s0B + gv[iB]; gdr = s0dr + gv[idr]
+            gnmc = (s0nmc + gv[inmc]) if has_nmc else 0.0
+            gqo = (s0qo + gv[iqo]) if has_qo else 0.0
+            for av, kA, nfA, tbA, cA, _ in FA_ub[:16]:
+                if has_reqs:
+                    ok = True
+                    for j in range(nrk):
+                        if kG[j] + kA[j] < req_caps[j]:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                dr = gdr + av[idr]
+                dr_c = 1.0 if dr > 1.0 else (0.0 if dr < 0.0 else dr)
+                num = ((1.0 + dr_c) * _qp(gqo + av[iqo])) if has_qo else (1.0 + dr_c)
+                st = _steps_base(gW + av[iW], gSa + av[iSa], gSp + av[iSp], gB + av[iB])
+                if has_nmc:
+                    nmc = gnmc + av[inmc]
+                    nmc_c = 0.99 if nmc > 0.99 else (0.0 if nmc < 0.0 else nmc)
+                    st += (1.0 - nmc_c) * mat0
+                r = num / st
+                if r >= best_r:
+                    tb = tbG + tbA; nf = nfG + nfA
+                    if r > best_r or (tb, nf) > (best_tb, best_nfill):
+                        best_r = r; best_tb = tb; best_nfill = nf
+                        best_load = list(cG) + list(cA); best_gv = gv; best_av = av
+
+        if best_load is not None:
+            eps_r = best_r / (1.0 + 1e-12) if best_r > 0 else best_r * (1.0 + 1e-12)
+            FG_ub = [x for x in FG_ub if x[5] >= eps_r]
+            FA_ub = [x for x in FA_ub if x[5] >= eps_r]
+
+        blocks = self._build_kd_blocks(FA_ub, max_idxs, min_idxs, has_reqs, nrk, leaf_size=32)
+
+        for gv, kG, nfG, tbG, cG, ubG in FG_ub:
+            if best_load is not None and ubG * (1.0 + 1e-12) < best_r:
+                break
+            gW = s0W + gv[iW]; gSa = s0Sa + gv[iSa]; gSp = s0Sp + gv[iSp]
+            gB = s0B + gv[iB]; gdr = s0dr + gv[idr]
+            gnmc = (s0nmc + gv[inmc]) if has_nmc else 0.0
+            gqo = (s0qo + gv[iqo]) if has_qo else 0.0
+            for b_box, b_kw, b_items in blocks:
+                if has_reqs:
+                    ok = True
+                    for j in range(nrk):
+                        if kG[j] + b_kw[j] < req_caps[j]:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                if best_load is not None:
+                    bub = _eval_ub(gW + b_box[iW], gSa + b_box[iSa], gSp + b_box[iSp],
+                                   gB + b_box[iB], gdr + b_box[idr],
+                                   (gnmc + b_box[inmc]) if has_nmc else 0.0,
+                                   (gqo + b_box[iqo]) if has_qo else 0.0)
+                    if bub * (1.0 + 1e-12) < best_r:
+                        continue
+                for av, kA, nfA, tbA, cA, _ in b_items:
+                    if has_reqs:
+                        ok = True
+                        for j in range(nrk):
+                            if kG[j] + kA[j] < req_caps[j]:
+                                ok = False
+                                break
+                        if not ok:
+                            continue
+                    dr = gdr + av[idr]
+                    dr_c = 1.0 if dr > 1.0 else (0.0 if dr < 0.0 else dr)
+                    num = ((1.0 + dr_c) * _qp(gqo + av[iqo])) if has_qo else (1.0 + dr_c)
+                    st = _steps_base(gW + av[iW], gSa + av[iSa], gSp + av[iSp], gB + av[iB])
+                    if has_nmc:
+                        nmc = gnmc + av[inmc]
+                        nmc_c = 0.99 if nmc > 0.99 else (0.0 if nmc < 0.0 else nmc)
+                        st += (1.0 - nmc_c) * mat0
+                    r = num / st
+                    if r >= best_r:
+                        tb = tbG + tbA; nf = nfG + nfA
+                        if r > best_r or (tb, nf) > (best_tb, best_nfill):
+                            best_r = r; best_tb = tb; best_nfill = nf
+                            best_load = list(cG) + list(cA); best_gv = gv; best_av = av
+
+        if best_load is None:
+            return float("-inf"), None, None
+        bsv = tuple(s0v[j] + best_gv[j] + best_av[j] for j in rng)
+        return best_r, best_load, dict(zip(AXES, bsv))
 
 
 def exact_craft_steps_optimize(recipe, character, *, skill, location,

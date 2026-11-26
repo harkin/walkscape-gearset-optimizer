@@ -326,13 +326,9 @@ class ExactFineRateOptimizer(ExactTargetRateOptimizer):
                 * (1.0 + self._k_fmf * (s.get("F", 0.0) + R.get("F", 0.0))))
 
     def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
-        """MITM FG x FA combine — identical to ExactCoinsOptimizer._combine_best
-        but with the multiplicative fine factor: numerator =
-        (1+dr)*(C0+A_coins)*(1+k_fmf*F). F is carried as its own frontier axis
-        (added to AXES/MAX_AXES in prepare), so Pareto-dominance still implies
-        score-dominance and the combine stays exact. Enables MITM speed for fine
-        (B&B fallback when a frontier exceeds the combine cap)."""
+        """Inlined KD-blocked upper-bound-pruned fine-rate FG × FA combine."""
         AXES = self.AXES
+        nax = len(AXES)
         s0 = {a: float(base_stats.get(a, 0.)) for a in AXES}
         s0v = tuple(s0[a] for a in AXES)
         iW = AXES.index("W"); iSa = AXES.index("S_add"); iSp = AXES.index("S_pct")
@@ -342,51 +338,143 @@ class ExactFineRateOptimizer(ExactTargetRateOptimizer):
         kf = self._k_fmf
         s0W = s0v[iW]; s0Sa = s0v[iSa]; s0Sp = s0v[iSp]; s0B = s0v[iB]
         s0dr = s0v[idr]; s0Ac = s0v[iAc]; s0F = s0v[iF]
-        FGv = [(tuple(g["v"][a] for a in AXES), g["kw"], g["comp"]) for g in FG]
-        FAv = [(tuple(a["v"][ax] for ax in AXES), a["kw"], a["comp"]) for a in FA]
-        step_cache = {}
+        max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
+        min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
+        rk = tuple(reqs); nrk = len(rk); req_caps = tuple(reqs[k] for k in rk)
+        has_reqs = nrk > 0
+        step_floor = self.STEP_FLOOR
+        _ceil = math.ceil
 
+        def _extract(fr):
+            out = []
+            for st in fr:
+                vt = st.get("vt")
+                if vt is None:
+                    v = st["v"]; vt = tuple(v[a] for a in AXES)
+                kwt = st.get("kwt")
+                if kwt is None:
+                    kw = st["kw"]; kwt = tuple(kw[k] for k in rk) if has_reqs else ()
+                comp = st["comp"]
+                out.append((vt, kwt, -len(comp), st.get("tb", 0.0), comp))
+            return out
+
+        FGv = _extract(FG); FAv = _extract(FA)
+        if not FGv or not FAv:
+            return float("-inf"), None, None
+        if has_reqs:
+            max_kwA = tuple(max(x[1][j] for x in FAv) for j in range(nrk))
+            FGv = [x for x in FGv if all(x[1][j] + max_kwA[j] >= req_caps[j] for j in range(nrk))]
+            if not FGv:
+                return float("-inf"), None, None
+            max_kwG = tuple(max(x[1][j] for x in FGv) for j in range(nrk))
+            FAv = [x for x in FAv if all(x[1][j] + max_kwG[j] >= req_caps[j] for j in range(nrk))]
+            if not FAv:
+                return float("-inf"), None, None
+
+        boxA = [0.0] * nax; boxG = [0.0] * nax
+        for j in max_idxs:
+            boxA[j] = max(x[0][j] for x in FAv); boxG[j] = max(x[0][j] for x in FGv)
+        for j in min_idxs:
+            boxA[j] = min(x[0][j] for x in FAv); boxG[j] = min(x[0][j] for x in FGv)
+
+        step_cache = {}
         def _steps(w, sa, sp, b):
             key = (w, sa, sp, b)
             st = step_cache.get(key)
             if st is None:
-                eff = min(WE_level + w, kappa)
-                stp = max(math.ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa), self.STEP_FLOOR)
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
                 st = stp / (1.0 + b)
                 step_cache[key] = st
             return st
 
-        reqs_items = list(reqs.items())
-        has_reqs = bool(reqs_items)
-        best_r = float("-inf"); best_nfill = None; best_load = None
-        best_gv = None; best_av = None
-        for gv, kG, cG in FGv:
+        FG_ub = [
+            (*x, ((1.0 + s0dr + x[0][idr] + boxA[idr])
+                  * (C0 + s0Ac + x[0][iAc] + boxA[iAc])
+                  * (1.0 + kf * (s0F + x[0][iF] + boxA[iF])))
+                 / _steps(s0W + x[0][iW] + boxA[iW], s0Sa + x[0][iSa] + boxA[iSa],
+                          s0Sp + x[0][iSp] + boxA[iSp], s0B + x[0][iB] + boxA[iB]))
+            for x in FGv
+        ]
+        FA_ub = [
+            (*x, ((1.0 + s0dr + boxG[idr] + x[0][idr])
+                  * (C0 + s0Ac + boxG[iAc] + x[0][iAc])
+                  * (1.0 + kf * (s0F + boxG[iF] + x[0][iF])))
+                 / _steps(s0W + boxG[iW] + x[0][iW], s0Sa + boxG[iSa] + x[0][iSa],
+                          s0Sp + boxG[iSp] + x[0][iSp], s0B + boxG[iB] + x[0][iB]))
+            for x in FAv
+        ]
+        FG_ub.sort(key=lambda x: x[5], reverse=True)
+        FA_ub.sort(key=lambda x: x[5], reverse=True)
+
+        best_r = float("-inf"); best_tb = float("-inf"); best_nfill = float("-inf")
+        best_load = None; best_gv = None; best_av = None
+
+        for gv, kG, nfG, tbG, cG, _ in FG_ub[:16]:
             gW = s0W + gv[iW]; gSa = s0Sa + gv[iSa]; gSp = s0Sp + gv[iSp]; gB = s0B + gv[iB]
             gdr = s0dr + gv[idr]; gAc = s0Ac + gv[iAc]; gF = s0F + gv[iF]
-            nG = len(cG)
-            for av, kA, cA in FAv:
+            for av, kA, nfA, tbA, cA, _ in FA_ub[:16]:
+                if has_reqs and any(kG[j] + kA[j] < req_caps[j] for j in range(nrk)):
+                    continue
+                r = ((1.0 + gdr + av[idr]) * (C0 + gAc + av[iAc]) * (1.0 + kf * (gF + av[iF]))) / _steps(
+                    gW + av[iW], gSa + av[iSa], gSp + av[iSp], gB + av[iB])
+                if r >= best_r:
+                    tb = tbG + tbA; nf = nfG + nfA
+                    if r > best_r or (tb, nf) > (best_tb, best_nfill):
+                        best_r = r; best_tb = tb; best_nfill = nf
+                        best_load = list(cG) + list(cA); best_gv = gv; best_av = av
+
+        if best_load is not None:
+            eps_r = best_r / (1.0 + 1e-12) if best_r > 0 else best_r * (1.0 + 1e-12)
+            FG_ub = [x for x in FG_ub if x[5] >= eps_r]
+            FA_ub = [x for x in FA_ub if x[5] >= eps_r]
+
+        blocks = self._build_kd_blocks(FA_ub, max_idxs, min_idxs, has_reqs, nrk, leaf_size=32)
+
+        for gv, kG, nfG, tbG, cG, ubG in FG_ub:
+            if best_load is not None and ubG * (1.0 + 1e-12) < best_r:
+                break
+            gW = s0W + gv[iW]; gSa = s0Sa + gv[iSa]; gSp = s0Sp + gv[iSp]; gB = s0B + gv[iB]
+            gdr = s0dr + gv[idr]; gAc = s0Ac + gv[iAc]; gF = s0F + gv[iF]
+            for b_box, b_kw, b_items in blocks:
                 if has_reqs:
                     ok = True
-                    for k, t in reqs_items:
-                        if kG[k] + kA[k] < t:
+                    for j in range(nrk):
+                        if kG[j] + b_kw[j] < req_caps[j]:
                             ok = False
                             break
                     if not ok:
                         continue
-                dr_tot = gdr + av[idr]
-                ac_tot = gAc + av[iAc]
-                f_tot = gF + av[iF]
-                r = ((1.0 + dr_tot) * (C0 + ac_tot) * (1.0 + kf * f_tot)) / _steps(
-                    gW + av[iW], gSa + av[iSa], gSp + av[iSp], gB + av[iB])
-                nfill = -(nG + len(cA))
-                if best_load is None or (r, nfill) > (best_r, best_nfill):
-                    best_r = r; best_nfill = nfill
-                    best_load = list(cG) + list(cA)
-                    best_gv = gv; best_av = av
+                if best_load is not None:
+                    bub = ((1.0 + gdr + b_box[idr]) * (C0 + gAc + b_box[iAc])
+                           * (1.0 + kf * (gF + b_box[iF]))) / _steps(
+                        gW + b_box[iW], gSa + b_box[iSa], gSp + b_box[iSp], gB + b_box[iB])
+                    if bub * (1.0 + 1e-12) < best_r:
+                        continue
+                for av, kA, nfA, tbA, cA, _ in b_items:
+                    if has_reqs:
+                        ok = True
+                        for j in range(nrk):
+                            if kG[j] + kA[j] < req_caps[j]:
+                                ok = False
+                                break
+                        if not ok:
+                            continue
+                    r = ((1.0 + gdr + av[idr]) * (C0 + gAc + av[iAc])
+                         * (1.0 + kf * (gF + av[iF]))) / _steps(
+                        gW + av[iW], gSa + av[iSa], gSp + av[iSp], gB + av[iB])
+                    if r >= best_r:
+                        tb = tbG + tbA; nf = nfG + nfA
+                        if r > best_r or (tb, nf) > (best_tb, best_nfill):
+                            best_r = r; best_tb = tb; best_nfill = nf
+                            best_load = list(cG) + list(cA); best_gv = gv; best_av = av
         if best_load is None:
             return float("-inf"), None, None
-        rng = range(len(AXES))
-        bsv = tuple(s0v[j] + best_gv[j] + best_av[j] for j in rng)
+        bsv = tuple(s0v[j] + best_gv[j] + best_av[j] for j in range(nax))
         return best_r, best_load, dict(zip(AXES, bsv))
 
 

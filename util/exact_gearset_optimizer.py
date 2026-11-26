@@ -25,6 +25,7 @@ activities.get_expected_drop_rate); numerator_bound MUST be an admissible upper
 bound or the B&B will prune the optimum.
 """
 import math
+import operator
 import itertools
 from collections import defaultdict
 import util.walkscape_constants as wc
@@ -414,27 +415,72 @@ class ExactGearsetOptimizer:
             _c.sort(key=_item_score, reverse=True)
 
         metas_at = [[] for _ in range(n)]
+        meta_idxs = {}
         for m in metas:
             idxs = [idx_of[sn] for sn in m.slots]; mask = 0
             for i in idxs:
                 mask |= (1 << i)
             metas_at[min(idxs)].append((m, mask))
+            meta_idxs[m.id] = idxs
 
         # Suffix reserves per axis (max for MAX_AXES, min for MIN_AXES) + keywords.
+        # Multi-slot set metas fill ALL their constituent slots (each j >= min(idxs)),
+        # so they can only contribute their EXCESS above the sum of those slots'
+        # individual reserves — avoiding 2x double-counting in the B&B upper bound.
+        slot_max = [{a: max([o.stats.get(a, 0.) for o in cand[i]] + [0.]) for a in self.MAX_AXES}
+                    for i in range(n)]
+        slot_min = [{a: min([o.stats.get(a, 0.) for o in cand[i]] + [0.]) for a in self.MIN_AXES}
+                    for i in range(n)]
+        slot_kw = [{k: max([o.keywords.count(k) for o in cand[i]] + [0]) for k in reqs}
+                   for i in range(n)]
+
         R = {a: [0.] * (n + 1) for a in AXES}
         RKW = [{k: 0 for k in reqs} for _ in range(n + 1)]
         for i in range(n - 1, -1, -1):
-            pool = list(cand[i]) + [m for m, _ in metas_at[i]]
+            ms = metas_at[i]
             for a in self.MAX_AXES:
-                R[a][i] = R[a][i + 1] + max([o.stats.get(a, 0.) for o in pool], default=0.)
+                ex = 0.0
+                for m, _ in ms:
+                    d = m.stats.get(a, 0.) - sum(slot_max[j][a] for j in meta_idxs[m.id])
+                    if d > ex:
+                        ex = d
+                R[a][i] = R[a][i + 1] + slot_max[i][a] + ex
             for a in self.MIN_AXES:
-                R[a][i] = R[a][i + 1] + min([o.stats.get(a, 0.) for o in pool] + [0.])
+                ex = 0.0
+                for m, _ in ms:
+                    d = m.stats.get(a, 0.) - sum(slot_min[j][a] for j in meta_idxs[m.id])
+                    if d < ex:
+                        ex = d
+                R[a][i] = R[a][i + 1] + slot_min[i][a] + ex
             for k in reqs:
-                RKW[i][k] = RKW[i + 1][k] + max([o.keywords.count(k) for o in pool], default=0)
+                ex_k = 0
+                for m, _ in ms:
+                    dk = m.keywords.count(k) - sum(slot_kw[j][k] for j in meta_idxs[m.id])
+                    if dk > ex_k:
+                        ex_k = dk
+                RKW[i][k] = RKW[i + 1][k] + slot_kw[i][k] + ex_k
 
-        best = {"r": float("-inf"), "tb": float("-inf"), "nfill": float("-inf"), "load": None, "s": None}
+        # Per-index reserve dicts, and each candidate's stat vector in AXES order
+        # (rec's state dicts are always built in AXES order, so s.values()
+        # lines up with it) plus its (keyword, count) contributions to reqs.
+        Rs = [{a: R[a][i] for a in AXES} for i in range(n + 1)]
+        RKWi = [tuple(RKW[i][k] for k in reqs) for i in range(n + 1)]
+        req_t = tuple(reqs.items())
+
+        def _prep(o):
+            kw = tuple((k, o.keywords.count(k)) for k in reqs) \
+                if any(k in o.keywords for k in reqs) else None
+            return o, tuple(o.stats.get(a, 0.) for a in AXES), kw
+        pool_full = [[_prep(it) for it in c] for c in cand]
+        pool_capped = [[_prep(it) for it in c] for c in cand_capped]
+        metas_v = [[(m, mask) + _prep(m)[1:] for m, mask in ms] for ms in metas_at]
+
+        _NEG_INF = float("-inf")
+        best = {"r": _NEG_INF, "tb": _NEG_INF, "nfill": _NEG_INF, "load": None, "s": None}
         _nodes = [0]; _aborted = [False]; _seed_stop = [False]
         cap_axis = self.CAP_AXIS
+        node_budget = self.NODE_BUDGET
+        _add = operator.add
 
         # Ring-pair permutation symmetry breaking. _pair_rA/_pair_rB are the
         # (earlier, later) slot indices of the interchangeable ring pair;
@@ -454,7 +500,7 @@ class ExactGearsetOptimizer:
         _rA_pick = [None]
 
         def bound(idx, s):
-            Ri = {a: R[a][idx] for a in AXES}
+            Ri = Rs[idx]
             if lambda_val is None:
                 return self.bound_value(X0, S0, kappa, WE_level, s, Ri)
             # Dinkelbach subproblem: admissible upper bound on (num - lambda*steps)
@@ -466,13 +512,15 @@ class ExactGearsetOptimizer:
             if _aborted[0] or _seed_stop[0]:
                 return
             _nodes[0] += 1
-            if _nodes[0] > self.NODE_BUDGET:
+            if _nodes[0] > node_budget:
                 _aborted[0] = True
                 return
-            for k, t in reqs.items():
-                if tally[k] + RKW[idx][k] < t:
-                    return
-            if best["r"] > float("-inf") and bound(idx, s) < best["r"]:
+            if req_t:
+                rk = RKWi[idx]
+                for j, (k, t) in enumerate(req_t):
+                    if tally[k] + rk[j] < t:
+                        return
+            if best["r"] > _NEG_INF and bound(idx, s) < best["r"]:
                 return
             if idx == n:
                 if lambda_val is None:
@@ -485,7 +533,7 @@ class ExactGearsetOptimizer:
                 # is filtered post-hoc; compaction keeps the list bounded.
                 if self._dump_active and lambda_val is None:
                     self._plateau_seen += 1
-                    if best["r"] > float("-inf") and r >= best["r"] * (1.0 - self._PLATEAU_REL_EPS):
+                    if best["r"] > _NEG_INF and r >= best["r"] * (1.0 - self._PLATEAU_REL_EPS):
                         self._plateau_hits += 1
                         self._plateau_dump.append(
                             (r, {a: s[a] for a in AXES},
@@ -509,8 +557,8 @@ class ExactGearsetOptimizer:
                 rec(idx + 1, filled, s, tally, used, ban, chosen, tb); return
             sn = order[idx]
             is_rA = (idx == _pair_rA); is_rB = (idx == _pair_rB)
-            _pool = cand_capped[idx] if (WE_level + s[cap_axis] >= kappa - 1e-12) else cand[idx]
-            for it in _pool:
+            _pool = pool_capped[idx] if (WE_level + s[cap_axis] >= kappa - 1e-12) else pool_full[idx]
+            for it, itv, kwc in _pool:
                 if used.get(it.id, 0) >= it.qty:
                     continue
                 if is_rB and _rA_pick[0] is not None:
@@ -520,11 +568,11 @@ class ExactGearsetOptimizer:
                     if _rA_pick[0] == -1 or _ring_canon.get(it.id, -1) < _rA_pick[0]:
                         continue
                 nt = tally
-                if any(k in it.keywords for k in reqs):
+                if kwc is not None:
                     nt = dict(tally)
-                    for k in reqs:
-                        nt[k] += it.keywords.count(k)
-                ns = {a: s[a] + it.stats.get(a, 0.) for a in AXES}
+                    for k, c in kwc:
+                        nt[k] += c
+                ns = dict(zip(AXES, map(_add, s.values(), itv)))
                 used[it.id] = used.get(it.id, 0) + 1; chosen.append((sn, it.id))
                 if is_rA:
                     _prev_pick = _rA_pick[0]; _rA_pick[0] = _ring_canon.get(it.id, None)
@@ -532,15 +580,15 @@ class ExactGearsetOptimizer:
                 if is_rA:
                     _rA_pick[0] = _prev_pick
                 chosen.pop(); used[it.id] -= 1
-            for m, mask in metas_at[idx]:
+            for m, mask, mv, kwc in metas_v[idx]:
                 if mask & filled or any(used.get(c, 0) > 0 for c in m.component_ids):
                     continue
-                ns = {a: s[a] + m.stats.get(a, 0.) for a in AXES}
+                ns = dict(zip(AXES, map(_add, s.values(), mv)))
                 nt = tally
-                if any(k in m.keywords for k in reqs):
+                if kwc is not None:
                     nt = dict(tally)
-                    for k in reqs:
-                        nt[k] += m.keywords.count(k)
+                    for k, c in kwc:
+                        nt[k] += c
                 for c in m.component_ids:
                     used[c] = used.get(c, 0) + 1
                 chosen.append(("+".join(m.slots), m.id))
@@ -597,44 +645,170 @@ class ExactGearsetOptimizer:
         print(f"[DINKELBACH] iters={iters} lambda={lam:.6f} nodes={per_iter_nodes} exhausted={exhausted}")
         return r, best_load, best_s
 
-    # ── meet-in-the-middle / group-DP (prototype; no-req, no-meta only) ───────
-    def _group_collapse(self, slot_defs, metas=(), reqs=None):
+    # ── meet-in-the-middle / group-DP ────────────────────────────────────────
+    def _compute_headroom(self, kappa, base, WE_level, comp_slot_lists, comp_metas):
+        """Exact saturation-headroom caps H_a = C_a - F_a - L_comp_a for a group
+        whose complement consists of `comp_slot_lists` and `comp_metas`. Any state
+        in the group with raw axis value >= H_a is guaranteed to saturate C_a in
+        EVERY completion, so capping its dominance key at H_a is provably exact."""
+        sat_caps = self._saturation_caps(kappa, base)
+        if not sat_caps:
+            return {}
+        hv = {}
+        cap_axis = self.CAP_AXIS
+        for ax, cap in sat_caps.items():
+            if cap is None:
+                continue
+            fa = base.get(ax, 0.0) + (float(WE_level) if ax == cap_axis else 0.0)
+            la = 0.0
+            for lst in comp_slot_lists:
+                lo = 0.0
+                for it in lst:
+                    val = it.stats.get(ax, 0.0)
+                    if val < lo:
+                        lo = val
+                la += lo
+            for m in comp_metas:
+                mv = m.stats.get(ax, 0.0)
+                if mv < 0.0:
+                    la += mv
+            hv[ax] = cap - fa - la
+        return hv
+
+    @staticmethod
+    def _sfs_prune_tuples(items):
+        """Sort-Filter-Skyline exact Pareto prune on tuples:
+            (dt, v_tup, kw_tup, comp, tb, dt_sum)
+        where higher is better on every coordinate of `dt`. Tie-breaks on exact
+        `dt` equality by higher `tb`, then shorter `comp`."""
+        if len(items) <= 1:
+            return items
+        dlen = len(items[0][0])
+        items.sort(key=lambda s: (-s[5], -s[4], len(s[3])))
+        kept = []
+        for s in items:
+            sdt = s[0]
+            s_tb = s[4]
+            s_sum = s[5]
+            dominated = False
+            for k in kept:
+                kdt = k[0]
+                dom = True
+                for j in range(dlen):
+                    if kdt[j] < sdt[j]:
+                        dom = False
+                        break
+                if dom:
+                    if k[4] < s_tb and kdt == sdt:
+                        continue
+                    dominated = True
+                    break
+            if dominated:
+                continue
+            # Only earlier kept entries with k_sum <= s_sum + 1e-9 could possibly
+            # be dominated by s (due to float sum rounding).
+            thr = s_sum + 1e-9
+            new_kept = []
+            for k in kept:
+                if k[5] <= thr:
+                    kdt = k[0]
+                    dom = True
+                    for j in range(dlen):
+                        if sdt[j] < kdt[j]:
+                            dom = False
+                            break
+                    if dom and not (s_tb < k[4] and sdt == kdt):
+                        continue
+                new_kept.append(k)
+            new_kept.append(s)
+            kept = new_kept
+        return kept
+
+    @staticmethod
+    def _build_kd_blocks(items, max_idxs, min_idxs, has_reqs, n_reqs, leaf_size=32):
+        """Partition combine-side frontier items into tight spatial KD-blocks of
+        size <= `leaf_size` with per-block axis bounding boxes and keyword maxima.
+        Each item is (v_tup, kw_tup, nfill, tb, comp, ub)."""
+        if not items:
+            return []
+        nax = len(items[0][0])
+        all_idxs = tuple(max_idxs) + tuple(min_idxs)
+        leaves = []
+
+        def _split(sub):
+            if len(sub) <= leaf_size:
+                leaves.append(sub)
+                return
+            best_ax = -1
+            best_spread = 0.0
+            for ax in all_idxs:
+                lo = hi = sub[0][0][ax]
+                for x in sub:
+                    v = x[0][ax]
+                    if v < lo:
+                        lo = v
+                    elif v > hi:
+                        hi = v
+                sp = hi - lo
+                if sp > 1e-12:
+                    norm = sp / (abs(hi) + abs(lo) + 1e-9)
+                    if norm > best_spread:
+                        best_spread = norm
+                        best_ax = ax
+            if best_ax < 0:
+                leaves.append(sub)
+                return
+            sub.sort(key=lambda x: x[0][best_ax])
+            mid = len(sub) // 2
+            _split(sub[:mid])
+            _split(sub[mid:])
+
+        _split(list(items))
+
+        blocks = []
+        for sub in leaves:
+            box = [0.0] * nax
+            for ax in max_idxs:
+                mx = sub[0][0][ax]
+                for x in sub:
+                    v = x[0][ax]
+                    if v > mx:
+                        mx = v
+                box[ax] = mx
+            for ax in min_idxs:
+                mn = sub[0][0][ax]
+                for x in sub:
+                    v = x[0][ax]
+                    if v < mn:
+                        mn = v
+                box[ax] = mn
+            if has_reqs:
+                bkw = tuple(max(x[1][r] for x in sub) for r in range(n_reqs))
+            else:
+                bkw = ()
+            max_ub = max(x[5] for x in sub)
+            blocks.append((max_ub, tuple(box), bkw, sub))
+        blocks.sort(key=lambda b: b[0], reverse=True)
+        return [(b[1], b[2], b[3]) for b in blocks]
+
+    def _group_collapse(self, slot_defs, metas=(), reqs=None, headroom=None):
         """Collapse a set of slots into their Pareto frontier of partial
-        gearsets. Each state carries its axis vector, per-requirement keyword
-        provision (kw), and comp (list of (slot_label, cid)) for reconstruction.
-        Enforces item uniqueness within the group. Ties (identical axis vector)
-        keep the fewer-pieces state. `metas` are atomic multi-slot set-pieces
-        whose slots are ALL within this group; each is offered at its earliest
-        slot and occupies a filled mask. `reqs` are keyword-count requirements —
-        a state that provides MORE of a required keyword is NOT dominated (it may
-        be needed to satisfy the requirement in the combine), so keyword
-        provision is a dominance dimension (capped at the requirement, since
-        excess is useless)."""
+        gearsets. Uses flat tuples + SFS (Sort-Filter-Skyline) dominance,
+        optional saturation-headroom caps, and a final (mask, used)-free prune
+        once all slots in the group are assigned (exact because groups have
+        disjoint slots and item pools)."""
         from collections import defaultdict
         AXES = self.AXES
+        nax = len(AXES)
         reqs = reqs or {}
+        rk = tuple(reqs)
+        nrk = len(rk)
+        req_caps = tuple(reqs[k] for k in rk)
         labels = [lbl for lbl, _ in slot_defs]
         cands = [c for _, c in slot_defs]
         idx_of = {lbl: i for i, lbl in enumerate(labels)}
         n = len(labels)
 
-        # Owned-quantity-aware uniqueness. An item may be equipped up to its
-        # owned qty (mirrors the B&B: `used.get(id,0) >= it.qty`). The OLD code
-        # tracked `used` as an id-set (qty=1), so it could never place two copies
-        # of an owned-in-multiples item — most importantly two identical rings
-        # (ring1/ring2 share one candidate pool). That made MITM unable to reach
-        # gearsets the B&B could (e.g. 2x a light-source ring to satisfy a
-        # keyword-count requirement), so MITM missed the true optimum on
-        # duplicate-dependent activities (Halfmaw tracking, Bog fishing (Spear)).
-        #
-        # An item is residual-CONSTRAINED only when more slots in this group can
-        # select it than its owned qty allows (qty < #eligible slots). Only those
-        # items' residual counts affect future feasibility, so only they enter
-        # the Pareto-prune key — otherwise the frontier would stop collapsing.
-        # Distinct-slot groups (gear/tools) have no shared candidate, so this set
-        # is empty and the frontier collapses exactly as before (no slowdown);
-        # the ring pair is the only group where it bites, and there only qty-1
-        # rings split the frontier.
         seen_in = defaultdict(int); qty_of = {}
         for cl in cands:
             for _cid in {c.id for c in cl}:
@@ -652,158 +826,269 @@ class ExactGearsetOptimizer:
                 mask |= (1 << i)
             metas_at[idxs[0]].append((m, mask))
 
-        # Flat-tuple dominance: precompute each state's comparison vector once —
-        # MAX axes as-is, MIN axes negated, then keyword provision — so
-        # "A dominates B" reduces to a single componentwise >= scan with early
-        # exit, no per-axis dict lookups (~3-5x faster than the old dict compare,
-        # which was 31.5M calls on Cave's gear build).
-        _MAXA = self.MAX_AXES; _MINA = self.MIN_AXES; _RK = tuple(reqs)
-        _DLEN = len(_MAXA) + len(_MINA) + len(_RK)
+        max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
+        min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
+        hv = headroom or {}
+        max_caps = tuple(hv.get(a, None) for a in self.MAX_AXES)
+        has_caps = any(c is not None for c in max_caps)
+        dlen = len(max_idxs) + len(min_idxs) + nrk
 
-        def _dt(s):
-            v = s["v"]; kw = s["kw"]
-            return (tuple(v[a] for a in _MAXA)
-                    + tuple(-v[a] for a in _MINA)
-                    + tuple(kw[k] for k in _RK))
+        def _make_dt(vt, kwt):
+            if has_caps:
+                dt = (tuple(vt[ax] if cap is None or vt[ax] <= cap else cap
+                            for ax, cap in zip(max_idxs, max_caps))
+                      + tuple(-vt[ax] for ax in min_idxs)
+                      + kwt)
+            else:
+                dt = (tuple(vt[ax] for ax in max_idxs)
+                      + tuple(-vt[ax] for ax in min_idxs)
+                      + kwt)
+            return dt, sum(dt)
 
-        def dominates_t(da, db):
-            for i in range(_DLEN):
-                if da[i] < db[i]:
-                    return False
-            return True
-
-        def gkey(s):
-            # States are comparable only if they filled the SAME slots (a meta
-            # pre-fills future slots, so its vector isn't comparable to a state
-            # that still has them open) AND hold the SAME residual of any
-            # quantity-constrained shared item (otherwise a state that still has
-            # a required duplicate available could be wrongly dropped for one
-            # that already spent it).
-            return (s["mask"], tuple(s["used"].get(i, 0) for i in shared_ids))
-
-        def prune(sts):
+        def _prune_grouped(sts):
             groups = defaultdict(list)
             for s in sts:
-                dt = s.get("dt")
-                if dt is None:
-                    dt = s["dt"] = _dt(s)
-                groups[gkey(s)].append(s)
+                # s = (dt, vt, kwt, comp, tb, dt_sum, used, mask)
+                gk = (s[7], tuple(s[6].get(i, 0) for i in shared_ids)) if shared_ids else s[7]
+                groups[gk].append(s)
             out = []
             for g in groups.values():
-                # Sort by primary MAX axis (dt[0]) DESC, then fewer pieces. In
-                # descending-primary order every already-kept state has
-                # primary >= the current one, so the current state can only
-                # dominate kept states with EQUAL primary — the removal scan
-                # skips all unequal-primary kept (near-free), eliminating the
-                # expensive full "s dominates kept" pass.
-                g.sort(key=lambda s: (-s["dt"][0], len(s["comp"])))
+                if len(g) <= 1:
+                    out.extend(g)
+                    continue
+                g.sort(key=lambda s: (-s[5], -s[4], len(s[3])))
                 kept = []
                 for s in g:
-                    sdt = s["dt"]; sp = sdt[0]
+                    sdt = s[0]; s_tb = s[4]; s_sum = s[5]
                     dominated = False
                     for k in kept:
-                        if dominates_t(k["dt"], sdt):
+                        kdt = k[0]
+                        dom = True
+                        for j in range(dlen):
+                            if kdt[j] < sdt[j]:
+                                dom = False
+                                break
+                        if dom:
+                            if k[4] < s_tb and kdt == sdt:
+                                continue
                             dominated = True
                             break
                     if dominated:
                         continue
-                    kept = [k for k in kept
-                            if k["dt"][0] != sp or not dominates_t(sdt, k["dt"])]
-                    kept.append(s)
+                    thr = s_sum + 1e-9
+                    new_kept = []
+                    for k in kept:
+                        if k[5] <= thr:
+                            kdt = k[0]
+                            dom = True
+                            for j in range(dlen):
+                                if sdt[j] < kdt[j]:
+                                    dom = False
+                                    break
+                            if dom and not (s_tb < k[4] and sdt == kdt):
+                                continue
+                        new_kept.append(k)
+                    new_kept.append(s)
+                    kept = new_kept
                 out.extend(kept)
             return out
 
-        def _kw_add(base_kw, obj):
-            if not reqs:
-                return base_kw
-            return {k: min(base_kw[k] + obj.keywords.count(k), reqs[k]) for k in reqs}
-
         def _uinc(used, ids):
+            if not shared_ids and not metas:
+                return used
             nu = dict(used)
             for c in ids:
                 nu[c] = nu.get(c, 0) + 1
             return nu
 
-        z_kw = {k: 0 for k in reqs}
-        states = [{"v": {a: 0.0 for a in AXES}, "kw": z_kw, "comp": (), "used": {}, "mask": 0}]
+        # Pre-extract candidate vectors
+        cands_prep = [
+            [(it, tuple(it.stats.get(a, 0.0) for a in AXES),
+              tuple(it.keywords.count(k) for k in rk) if nrk else ())
+             for it in cl]
+            for cl in cands
+        ]
+        metas_prep = [
+            [(m, mask, tuple(m.stats.get(a, 0.0) for a in AXES),
+              tuple(m.keywords.count(k) for k in rk) if nrk else ())
+             for m, mask in ms]
+            for ms in metas_at
+        ]
+
+        z_v = (0.0,) * nax
+        z_kw = (0,) * nrk
+        z_dt, z_sum = _make_dt(z_v, z_kw)
+        states = [(z_dt, z_v, z_kw, (), 0.0, z_sum, {}, 0)]
+        rng_ax = range(nax)
+        rng_rk = range(nrk)
+        need_used = bool(shared_ids or metas)
+
         for i in range(n):
             label = labels[i]
+            bit = 1 << i
+            cp = cands_prep[i]
+            mp = metas_prep[i]
+            if not cp and not mp:
+                continue
             nxt = []
             for st in states:
-                if st["mask"] & (1 << i):
-                    nxt.append(st)                   # slot already filled by a meta
+                mask = st[7]
+                if mask & bit:
+                    nxt.append(st)
                     continue
-                nxt.append(st)                       # empty option for this slot
-                for it in cands[i]:
-                    if st["used"].get(it.id, 0) >= it.qty:   # qty-aware (was: id in set)
+                nxt.append(st)
+                sv, skw, scomp, stb, sused = st[1], st[2], st[3], st[4], st[6]
+                for it, itv, itkw in cp:
+                    if need_used and sused.get(it.id, 0) >= it.qty:
                         continue
-                    nxt.append({
-                        "v": {a: st["v"][a] + it.stats.get(a, 0.) for a in AXES},
-                        "kw": _kw_add(st["kw"], it),
-                        "comp": st["comp"] + ((label, it.id),),
-                        "used": _uinc(st["used"], (it.id,)),
-                        "mask": st["mask"]})
-                for m, mask in metas_at[i]:
-                    if st["mask"] & mask or any(st["used"].get(c, 0) > 0 for c in m.component_ids):
+                    nv = tuple(sv[j] + itv[j] for j in rng_ax)
+                    nkw = (tuple(min(skw[j] + itkw[j], req_caps[j]) for j in rng_rk)
+                           if nrk else z_kw)
+                    ndt, nsum = _make_dt(nv, nkw)
+                    nu = _uinc(sused, (it.id,)) if need_used else sused
+                    nxt.append((ndt, nv, nkw, scomp + ((label, it.id),),
+                                stb + it.tb, nsum, nu, mask))
+                for m, mmask, mv, mkw in mp:
+                    if (mask & mmask) or any(sused.get(c, 0) > 0 for c in m.component_ids):
                         continue
-                    nxt.append({
-                        "v": {a: st["v"][a] + m.stats.get(a, 0.) for a in AXES},
-                        "kw": _kw_add(st["kw"], m),
-                        "comp": st["comp"] + (("+".join(m.slots), m.id),),
-                        "used": _uinc(st["used"], m.component_ids),
-                        "mask": st["mask"] | mask})
-            states = prune(nxt)
-        return states
+                    nv = tuple(sv[j] + mv[j] for j in rng_ax)
+                    nkw = (tuple(min(skw[j] + mkw[j], req_caps[j]) for j in rng_rk)
+                           if nrk else z_kw)
+                    ndt, nsum = _make_dt(nv, nkw)
+                    nu = _uinc(sused, m.component_ids)
+                    nxt.append((ndt, nv, nkw, scomp + (("+".join(m.slots), m.id),),
+                                stb + m.tb, nsum, nu, mask | mmask))
+            states = _prune_grouped(nxt)
 
-    _MITM_COMBINE_CAP = 8_000_000
-    # Max |FT|·|FR| accessory product to attempt the FA pre-merge on. A bail
-    # already pays the FG/FT/FR build, and MITM just reuses those frontiers with
-    # a combine bounded by _MITM_COMBINE_CAP — so MITM is never slower than
-    # bailing to B&B. This cap only guards against a pathologically huge
-    # accessory product (tool-heavy activities) making the FA merge itself
-    # (O(|FT|·|FR|·|FA|)) blow up. Coral (~3.5k), Cave (~2k), Bog Net (~22k) all
-    # run MITM; only extreme tool pools bail.
-    _FA_BUILD_CAP = 60_000
+        # Final ungrouped Pareto prune: once all slots in this group are filled,
+        # mask and used cannot affect any other (disjoint) group!
+        final_tups = [(s[0], s[1], s[2], s[3], s[4], s[5]) for s in states]
+        final_tups = self._sfs_prune_tuples(final_tups)
+        return [
+            {
+                "v": dict(zip(AXES, s[1])),
+                "vt": s[1],
+                "kw": dict(zip(rk, s[2])) if nrk else {},
+                "kwt": s[2],
+                "comp": s[3],
+                "tb": s[4],
+            }
+            for s in final_tups
+        ]
+
+    _MITM_COMBINE_CAP = 100_000_000
+    _FA_BUILD_CAP = 150_000
+
+    def _partition_mitm_groups(self, slots, metas):
+        """Partition slots + metas into 3 disjoint groups (G_slots, T_slots, R_slots)
+        with their local metas (g_metas, t_metas, r_metas), or return None if a
+        set meta cannot be contained in one group cleanly."""
+        g_slots = list(self.SINGLE)
+        t_slots = ["tools", "pet", "consumable"]
+        r_slots = ["ring1", "ring2"]
+        g_set = set(g_slots); t_set = set(t_slots); r_set = set(r_slots)
+
+        g_metas = []; t_metas = []; r_metas = []; cross = []
+        for m in metas:
+            ms = set(m.slots)
+            if ms <= g_set:
+                g_metas.append(m)
+            elif ms <= r_set:
+                r_metas.append(m)
+            elif ms <= t_set:
+                t_metas.append(m)
+            else:
+                cross.append(m)
+
+        if cross:
+            # Handle cross-group armor+ring set metas (e.g. Adventuring amulet
+            # neck + Adventuring ring) by moving the armor slot(s) into R_slots.
+            move_to_r = set()
+            for m in cross:
+                ms = set(m.slots)
+                if ms <= (g_set | r_set):
+                    move_to_r |= (ms & g_set)
+                else:
+                    return None
+            # Check if any g_meta touches moved slots; if so, bail if too large
+            if len(move_to_r) > 3:
+                return None
+            g_slots = [s for s in g_slots if s not in move_to_r]
+            r_slots = r_slots + sorted(move_to_r)
+            g_set = set(g_slots); r_set = set(r_slots)
+            g_metas = []; r_metas = []
+            for m in metas:
+                ms = set(m.slots)
+                if ms <= g_set:
+                    g_metas.append(m)
+                elif ms <= r_set:
+                    r_metas.append(m)
+                elif ms <= t_set:
+                    pass
+                else:
+                    return None
+        return (g_slots, g_metas), (t_slots, t_metas), (r_slots, r_metas)
 
     def _optimize_mitm(self, slots, metas, reqs, X0, S0, kappa, WE_level, base_stats):
-        """Meet-in-the-middle: collapse gear / tools-bundle / rings to Pareto
-        frontiers, then combine by true score. Set-metas (armor sets, slots all
-        within the gear group) fold into the gear frontier as atomic options.
-        Keyword requirements are enforced as an O(1) feasibility check in the
-        combine (sum of per-group keyword provision >= threshold). Exact: the
-        only cross-group coupling is the WE cap + the additive requirement, both
-        evaluated in the combine. Returns (r, load, s), or (-inf, None, None) to
-        bail (combine product over the cap, or no feasible combine)."""
-        AXES = self.AXES
+        """Meet-in-the-middle: collapse 3 disjoint groups to Pareto frontiers
+        with saturation headroom caps, dynamically merge the smallest pair, then
+        combine with KD-blocked upper-bound pruning."""
         reqs = reqs or {}
-        fr = self._mitm_frontiers(slots, metas, reqs)
+        fr = self._mitm_frontiers(slots, metas, reqs, kappa=kappa,
+                                  WE_level=WE_level, base_stats=base_stats)
         if fr is None:
-            return float("-inf"), None, None      # bail -> caller falls back to B&B
-        FG, FT, FR, FA = fr
-        return self._combine_best(FG, FA, reqs, X0, S0, kappa, WE_level, base_stats)
+            return float("-inf"), None, None
+        F1, _FT, _FR, F2 = fr
+        return self._combine_best(F1, F2, reqs, X0, S0, kappa, WE_level, base_stats)
 
-    def _mitm_frontiers(self, slots, metas, reqs):
-        """Build the MITM Pareto frontiers (FG gear, FT tools+pet+consumable,
-        FR ring-pair, FA = FT∪FR merged) for a candidate `slots` set. Returns
-        (FG, FT, FR, FA) or None to bail (accessory product or combine product
-        over cap -> caller falls back to B&B). Split out of _optimize_mitm so the
-        frontiers can be CACHED and reused across recipes that share the same
-        (skill, location, reqs, pools) — the frontiers depend only on the item
-        pools, not on base_steps/kappa/WE_level/base_stats (those enter the
-        combine). See _run's frontier cache."""
+    def _mitm_frontiers(self, slots, metas, reqs, kappa=None, WE_level=0.0, base_stats=None):
+        """Build the MITM Pareto frontiers for `slots` + `metas`. When `kappa`
+        and `base_stats` are provided, applies exact per-group saturation
+        headroom caps and dynamically merges the smallest pair among (FG, FT, FR).
+        Returns (F1, FT, FR, F2) where (F1, F2) are the two frontiers to combine,
+        or None to bail."""
         reqs = reqs or {}
-        ring = slots.get("ring1", [])
-        FG = self._group_collapse([(sl, slots.get(sl, [])) for sl in self.SINGLE], metas, reqs)
-        FT = self._group_collapse([("tools", slots.get("tools", [])),
-                                   ("pet", slots.get("pet", [])),
-                                   ("consumable", slots.get("consumable", []))], reqs=reqs)
-        FR = self._group_collapse([("ring1", ring), ("ring2", ring)], reqs=reqs)
-        if len(FT) * len(FR) > self._FA_BUILD_CAP:
+        part = self._partition_mitm_groups(slots, metas)
+        if part is None:
             return None
-        FA = self._merge_accessories(FT, FR, reqs)
-        if len(FG) * len(FA) > self._MITM_COMBINE_CAP:
+        (g_slots, g_metas), (t_slots, t_metas), (r_slots, r_metas) = part
+
+        use_hr = (kappa is not None and base_stats is not None)
+        g_lists = [slots.get(sl, []) for sl in g_slots]
+        t_lists = [slots.get(sl, []) for sl in t_slots]
+        r_lists = [slots.get(sl, []) for sl in r_slots]
+
+        hr_g = self._compute_headroom(kappa, base_stats, WE_level, t_lists + r_lists, t_metas + r_metas) if use_hr else None
+        hr_t = self._compute_headroom(kappa, base_stats, WE_level, g_lists + r_lists, g_metas + r_metas) if use_hr else None
+        hr_r = self._compute_headroom(kappa, base_stats, WE_level, g_lists + t_lists, g_metas + t_metas) if use_hr else None
+
+        FG = self._group_collapse([(sl, slots.get(sl, [])) for sl in g_slots], g_metas, reqs, headroom=hr_g)
+        FT = self._group_collapse([(sl, slots.get(sl, [])) for sl in t_slots], t_metas, reqs, headroom=hr_t)
+        FR = self._group_collapse([(sl, slots.get(sl, [])) for sl in r_slots], r_metas, reqs, headroom=hr_r)
+
+        # Dynamic 2-way merge order: pick the pair with the smallest product!
+        p_tr = len(FT) * len(FR)
+        p_gr = len(FG) * len(FR)
+        p_gt = len(FG) * len(FT)
+        best_p = min(p_tr, p_gr, p_gt)
+        if best_p > self._FA_BUILD_CAP:
             return None
-        return (FG, FT, FR, FA)
+        if best_p == p_tr:
+            hr_m = self._compute_headroom(kappa, base_stats, WE_level, g_lists, g_metas) if use_hr else None
+            FM = self._merge_accessories(FT, FR, reqs, headroom=hr_m)
+            F1, F2 = FG, FM
+        elif best_p == p_gr:
+            hr_m = self._compute_headroom(kappa, base_stats, WE_level, t_lists, t_metas) if use_hr else None
+            FM = self._merge_accessories(FG, FR, reqs, headroom=hr_m)
+            F1, F2 = FM, FT
+        else:
+            hr_m = self._compute_headroom(kappa, base_stats, WE_level, r_lists, r_metas) if use_hr else None
+            FM = self._merge_accessories(FG, FT, reqs, headroom=hr_m)
+            F1, F2 = FM, FR
+
+        if len(F1) * len(F2) > self._MITM_COMBINE_CAP:
+            return None
+        return (F1, FT, FR, F2)
 
     # ── frontier reuse cache (recipe-gated) ──────────────────────────────────
     def _frontier_key(self, character, skill, location, reqs, pets, consumables):
@@ -836,10 +1121,15 @@ class ExactGearsetOptimizer:
         A_coins isn't an axis or factor≈1."""
         if "A_coins" not in self.AXES or abs(factor - 1.0) < 1e-15:
             return states
+        iAc = self.AXES.index("A_coins")
         out = []
         for s in states:
-            v = dict(s["v"]); v["A_coins"] = v.get("A_coins", 0.0) * factor
+            v = dict(s["v"]); new_ac = v.get("A_coins", 0.0) * factor
+            v["A_coins"] = new_ac
             ns = dict(s); ns["v"] = v; ns.pop("dt", None)
+            if "vt" in ns:
+                vt = list(ns["vt"]); vt[iAc] = new_ac
+                ns["vt"] = tuple(vt)
             out.append(ns)
         return out
 
@@ -898,97 +1188,190 @@ class ExactGearsetOptimizer:
         return gearset
 
     def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
-        """Generic FG × FA combine: pick the (gear, accessories) pair with the
-        best score, tie-broken toward fewer pieces. This is the EXACT reference
-        implementation. Objective subclasses (coins, XP) override it with an
-        inlined hot loop that reproduces bit-identical (best_r, best_load,
-        best_s). Returns (best_r, best_load, best_s), or (-inf, None, None) when
-        no feasible pair exists. Flatten frontier vectors to AXES-ordered tuples
-        (kills the per-pair dict rebuild) and memoize the pure-function steps
-        denominator, which depends only on (effWE, S_add, S_pct, B)."""
+        """Generic FG × FA combine with KD-blocked upper-bound pruning.
+        Exact for any subclass whose objective is monotone in MAX_AXES / MIN_AXES."""
         AXES = self.AXES
+        nax = len(AXES)
         s0 = {a: float(base_stats.get(a, 0.)) for a in AXES}
         s0v = tuple(s0[a] for a in AXES)
-        nax = len(AXES)
-        iW = AXES.index(self.CAP_AXIS)
-        iSa = AXES.index("S_add"); iSp = AXES.index("S_pct"); iB = AXES.index("B")
-        FGv = [(tuple(g["v"][a] for a in AXES), g["kw"], g["comp"]) for g in FG]
-        FAv = [(tuple(a["v"][ax] for ax in AXES), a["kw"], a["comp"]) for a in FA]
-        step_cache = {}
-        def _steps_of(sv):
-            key = (sv[iW], sv[iSa], sv[iSp], sv[iB])
-            st = step_cache.get(key)
-            if st is None:
-                eff = min(WE_level + sv[iW], kappa)
-                stp = max(math.ceil((S0 / (1.0 + eff)) * (1.0 + sv[iSp]) + sv[iSa]), self.STEP_FLOOR)
-                st = stp / (1.0 + sv[iB])
-                step_cache[key] = st
-            return st
-        best_r = float("-inf"); best_nfill = None; best_load = None; best_s = None
+        max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
+        min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
+        rk = tuple(reqs)
+        nrk = len(rk)
+        req_caps = tuple(reqs[k] for k in rk)
+        has_reqs = nrk > 0
         rng = range(nax)
-        for gv, kG, cG in FGv:
-            for av, kA, cA in FAv:
-                feasible = True
-                for k, t in reqs.items():
-                    if kG[k] + kA[k] < t:
-                        feasible = False
-                        break
-                if not feasible:
+
+        def _extract(fr):
+            out = []
+            for st in fr:
+                vt = st.get("vt")
+                if vt is None:
+                    v = st["v"]
+                    vt = tuple(v[a] for a in AXES)
+                kwt = st.get("kwt")
+                if kwt is None:
+                    kw = st["kw"]
+                    kwt = tuple(kw[k] for k in rk) if has_reqs else ()
+                comp = st["comp"]
+                out.append((vt, kwt, -len(comp), st.get("tb", 0.0), comp))
+            return out
+
+        FGv = _extract(FG)
+        FAv = _extract(FA)
+        if not FGv or not FAv:
+            return float("-inf"), None, None
+
+        # Pre-filter infeasible states by global max keyword supply of the other side
+        if has_reqs:
+            max_kwA = tuple(max(x[1][j] for x in FAv) for j in range(nrk))
+            FGv = [x for x in FGv if all(x[1][j] + max_kwA[j] >= req_caps[j] for j in range(nrk))]
+            if not FGv:
+                return float("-inf"), None, None
+            max_kwG = tuple(max(x[1][j] for x in FGv) for j in range(nrk))
+            FAv = [x for x in FAv if all(x[1][j] + max_kwG[j] >= req_caps[j] for j in range(nrk))]
+            if not FAv:
+                return float("-inf"), None, None
+
+        # Global bounding boxes for per-element optimistic upper bounds
+        boxA = [0.0] * nax
+        boxG = [0.0] * nax
+        for j in max_idxs:
+            boxA[j] = max(x[0][j] for x in FAv)
+            boxG[j] = max(x[0][j] for x in FGv)
+        for j in min_idxs:
+            boxA[j] = min(x[0][j] for x in FAv)
+            boxG[j] = min(x[0][j] for x in FGv)
+
+        def _score_sv(sv):
+            s = dict(zip(AXES, sv))
+            return self.score(X0, S0, kappa, WE_level, s)
+
+        FG_ub = []
+        for x in FGv:
+            vt = x[0]
+            ub = _score_sv(tuple(s0v[j] + vt[j] + boxA[j] for j in rng))
+            FG_ub.append((*x, ub))
+        FA_ub = []
+        for x in FAv:
+            vt = x[0]
+            ub = _score_sv(tuple(s0v[j] + boxG[j] + vt[j] for j in rng))
+            FA_ub.append((*x, ub))
+
+        FG_ub.sort(key=lambda x: x[5], reverse=True)
+        FA_ub.sort(key=lambda x: x[5], reverse=True)
+
+        best_r = float("-inf"); best_tb = float("-inf"); best_nfill = float("-inf")
+        best_load = None; best_gv = None; best_av = None
+
+        # Seed incumbent from top-16 x top-16
+        for gv, kG, nfG, tbG, cG, _ in FG_ub[:16]:
+            for av, kA, nfA, tbA, cA, _ in FA_ub[:16]:
+                if has_reqs and any(kG[j] + kA[j] < req_caps[j] for j in range(nrk)):
                     continue
                 sv = tuple(s0v[j] + gv[j] + av[j] for j in rng)
-                s = dict(zip(AXES, sv))
-                r = self.numerator(X0, s) / _steps_of(sv)
-                nfill = -(len(cG) + len(cA))
-                if best_load is None or (r, nfill) > (best_r, best_nfill):
-                    best_r = r; best_nfill = nfill
-                    best_load = list(cG) + list(cA)
-                    best_s = s
-        return best_r, best_load, best_s
+                r = _score_sv(sv)
+                tb = tbG + tbA; nf = nfG + nfA
+                if (r, tb, nf) > (best_r, best_tb, best_nfill):
+                    best_r = r; best_tb = tb; best_nfill = nf
+                    best_load = list(cG) + list(cA); best_gv = gv; best_av = av
 
-    def _merge_accessories(self, FT, FR, reqs):
-        """Pareto-merge the tool-bundle frontier FT and the ring-pair frontier
-        FR into a single accessories frontier, so the MITM combine is FG × FA
-        rather than FG × FT × FR. Tools and rings are disjoint item pools, so
-        every (bundle, ring-pair) pair is a valid combination. Dominance uses
-        RAW (uncapped) axes — a piece's surplus W must be preserved because
-        higher raw W is always weakly better once summed and clamped at κ (and a
-        downstream negative-W item could reclaim it) — and kw provision is
-        clamped to the requirement (excess is useless in the ≥-threshold
-        combine feasibility test). Exact by MITM monotonicity."""
-        AXES = self.AXES; MAXA = self.MAX_AXES; MINA = self.MIN_AXES
+        if best_load is not None:
+            eps_r = best_r / (1.0 + 1e-12) if best_r > 0 else best_r * (1.0 + 1e-12)
+            FG_ub = [x for x in FG_ub if x[5] >= eps_r]
+            FA_ub = [x for x in FA_ub if x[5] >= eps_r]
+
+        blocks = self._build_kd_blocks(FA_ub, max_idxs, min_idxs, has_reqs, nrk, leaf_size=32)
+
+        for gv, kG, nfG, tbG, cG, ubG in FG_ub:
+            if best_load is not None and ubG * (1.0 + 1e-12) < best_r:
+                break
+            gbase = tuple(s0v[j] + gv[j] for j in rng)
+            for b_box, b_kw, b_items in blocks:
+                if has_reqs and any(kG[j] + b_kw[j] < req_caps[j] for j in range(nrk)):
+                    continue
+                if best_load is not None:
+                    bub = _score_sv(tuple(gbase[j] + b_box[j] for j in rng))
+                    if bub * (1.0 + 1e-12) < best_r:
+                        continue
+                for av, kA, nfA, tbA, cA, _ in b_items:
+                    if has_reqs and any(kG[j] + kA[j] < req_caps[j] for j in range(nrk)):
+                        continue
+                    sv = tuple(gbase[j] + av[j] for j in rng)
+                    r = _score_sv(sv)
+                    tb = tbG + tbA; nf = nfG + nfA
+                    if (r, tb, nf) > (best_r, best_tb, best_nfill):
+                        best_r = r; best_tb = tb; best_nfill = nf
+                        best_load = list(cG) + list(cA); best_gv = gv; best_av = av
+
+        if best_load is None:
+            return float("-inf"), None, None
+        bsv = tuple(s0v[j] + best_gv[j] + best_av[j] for j in rng)
+        return best_r, best_load, dict(zip(AXES, bsv))
+
+    def _merge_accessories(self, FT, FR, reqs, headroom=None):
+        """Pareto-merge two disjoint frontiers FT and FR using flat tuples +
+        SFS (Sort-Filter-Skyline) and optional saturation-headroom caps."""
+        AXES = self.AXES
+        nax = len(AXES)
         reqs = reqs or {}
+        rk = tuple(reqs)
+        nrk = len(rk)
+        req_caps = tuple(reqs[k] for k in rk)
+        max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
+        min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
+        hv = headroom or {}
+        max_caps = tuple(hv.get(a, None) for a in self.MAX_AXES)
+        has_caps = any(c is not None for c in max_caps)
+        rng_ax = range(nax)
+        rng_rk = range(nrk)
+
+        def _prep(fr):
+            out = []
+            for st in fr:
+                vt = st.get("vt")
+                if vt is None:
+                    v = st["v"]
+                    vt = tuple(v[a] for a in AXES)
+                kwt = st.get("kwt")
+                if kwt is None:
+                    kw = st["kw"]
+                    kwt = tuple(kw[k] for k in rk) if nrk else ()
+                out.append((vt, kwt, tuple(st["comp"]), st.get("tb", 0.0)))
+            return out
+
+        pT = _prep(FT)
+        pR = _prep(FR)
         cand = []
-        for gT in FT:
-            vT = gT["v"]; kT = gT["kw"]; cT = gT["comp"]
-            for gR in FR:
-                vR = gR["v"]; kR = gR["kw"]
-                cand.append({
-                    "v": {a: vT[a] + vR[a] for a in AXES},
-                    "kw": {k: min(kT[k] + kR[k], reqs[k]) for k in reqs},
-                    "comp": list(cT) + list(gR["comp"])})
-        cand.sort(key=lambda s: len(s["comp"]))   # fewer pieces first (tie-break)
+        z_kw = ()
+        for vT, kT, cT, tbT in pT:
+            for vR, kR, cR, tbR in pR:
+                nv = tuple(vT[j] + vR[j] for j in rng_ax)
+                nkw = (tuple(min(kT[j] + kR[j], req_caps[j]) for j in rng_rk)
+                       if nrk else z_kw)
+                if has_caps:
+                    dt = (tuple(nv[ax] if cap is None or nv[ax] <= cap else cap
+                                for ax, cap in zip(max_idxs, max_caps))
+                          + tuple(-nv[ax] for ax in min_idxs)
+                          + nkw)
+                else:
+                    dt = (tuple(nv[ax] for ax in max_idxs)
+                          + tuple(-nv[ax] for ax in min_idxs)
+                          + nkw)
+                cand.append((dt, nv, nkw, cT + cR, tbT + tbR, sum(dt)))
 
-        def dom(A, B):
-            va, vb = A["v"], B["v"]
-            for a in MAXA:
-                if va[a] < vb[a]:
-                    return False
-            for a in MINA:
-                if va[a] > vb[a]:
-                    return False
-            ka, kb = A["kw"], B["kw"]
-            for k in reqs:
-                if ka[k] < kb[k]:
-                    return False
-            return True
-
-        kept = []
-        for s in cand:
-            if any(dom(k, s) for k in kept):
-                continue
-            kept = [k for k in kept if not dom(s, k)]
-            kept.append(s)
-        return kept
+        kept = self._sfs_prune_tuples(cand)
+        return [
+            {
+                "v": dict(zip(AXES, s[1])),
+                "vt": s[1],
+                "kw": dict(zip(rk, s[2])) if nrk else {},
+                "kwt": s[2],
+                "comp": s[3],
+                "tb": s[4],
+            }
+            for s in kept
+        ]
 
     # ── public entry ─────────────────────────────────────────────────────────
     def optimize(self, activity, character, skill=None, location=None, base_stats=None,
@@ -1158,104 +1541,299 @@ class ExactGearsetOptimizer:
         slots["ring1"] = list(ring); slots["ring2"] = list(ring)
 
         def pool_frontier(items, K, headroom=None):
+            """Exact tool-bundle Pareto DP with:
+              1. Bitmask conflict tokens (unique tokens ignored completely).
+              2. Conflict-grouped item ordering + dead-token masking (tokens
+                 that cannot appear on any remaining tool are cleared immediately).
+              3. Terminal (size == K) ban-free collapse during DP.
+              4. Flat-tuple SFS (Sort-Filter-Skyline) Pareto merge.
+              5. Final ban-free & size-free Pareto prune with empty output
+                 tokens (tool tokens never affect any non-tool slot)."""
             _PMAXA = self.MAX_AXES; _PMINA = self.MIN_AXES; _PRK = tuple(reqs)
-            _PLEN = len(_PMAXA) + len(_PMINA) + len(_PRK)
-            # Saturation-headroom caps (fc-preopt Step 2). Each MAX axis `a` that
-            # upper-saturates in the objective is capped in the dominance tuple at
-            # its per-solve headroom H_a = C_a - F_a - L_a (see
-            # util.saturation_headroom): C_a the objective cap, F_a the fixed
-            # (base+service+level) contribution, L_a a lower bound on the remaining
-            # non-tool slots. Exact per-completion (equivalence-gated). This
-            # GENERALIZES the old `_w_cap = kappa - WE_level`, which ignored
-            # service/base W and the remaining-slot drag and was therefore too
-            # tight under cursed stations (a latent exactness bug). `headroom` is a
-            # {axis: H} dict computed in optimize() once base + all non-tool slot
-            # pools + set-metas are known; absent -> no cap (raw frontier).
+            nax = len(AXES)
+            nrk = len(_PRK)
+            req_caps = tuple(reqs[k] for k in _PRK)
+            max_idxs = tuple(AXES.index(a) for a in _PMAXA)
+            min_idxs = tuple(AXES.index(a) for a in _PMINA)
             _HV = headroom or {}
+            max_caps = tuple(_HV.get(a, None) for a in _PMAXA)
+            has_caps = any(c is not None for c in max_caps)
+            _PLEN = len(max_idxs) + len(min_idxs) + nrk
+            rng_ax = range(nax)
+            rng_rk = range(nrk)
 
-            def _pdt(v, kw):
-                t = tuple(min(v[a], _HV[a]) if a in _HV else v[a]
-                          for a in _PMAXA)
-                return (t
-                        + tuple(-v[a] for a in _PMINA)
-                        + tuple(kw[k] for k in _PRK))
-            fr = [{"v": {a: 0. for a in AXES}, "kw": {k: 0 for k in reqs},
-                   "dt": (0.0,) * _PLEN,
-                   "ban": frozenset(), "size": 0, "comp": (), "tb": 0.0}]
-
-            def pdom(A, B):
-                # Flat-tuple numeric dominance (MAX as-is, MIN negated, kw) then
-                # token-ban subset + size — ~3-5x vs the old per-axis dict compare.
-                da, db = A["dt"], B["dt"]
-                for i in range(_PLEN):
-                    if da[i] < db[i]:
-                        return False
-                if not A["ban"] <= B["ban"]:
-                    return False
-                if A["size"] > B["size"]:
-                    return False
-                # On an EXACT tie across every scored axis + ban + size, prefer
-                # the bundle with more beneficial NON-scored stats (higher tb).
-                # Mirrors _dom's tie-break for single slots. Without this, two
-                # keyword-only tools tied on the objective (e.g. Clay skydisc CF2
-                # vs Golden skydisc CF12 for a collectible target where chest_
-                # finding isn't scored) were interchangeable and the first-
-                # enumerated won. Tie-only => never changes the optimum; it only
-                # keeps the strictly-nicer equivalent (and shrinks the frontier).
-                if (A["tb"] < B["tb"] and da == db
-                        and A["ban"] == B["ban"] and A["size"] == B["size"]):
-                    return False
-                return True
-            def _merge(fr, add):
-                # fr is ALREADY a Pareto antichain. Incorporate the new `add`
-                # states without re-checking fr-vs-fr (that O(len(fr)^2) rescan,
-                # repeated per item, was the 76M-comparison / ~40s bottleneck).
-                # The Pareto antichain is unique, so this yields the identical
-                # exact frontier as the old full re-prune.
-                surv = []
-                for a in add:
-                    if any(pdom(k, a) for k in fr):
-                        continue
-                    if any(pdom(k, a) for k in surv):
-                        continue
-                    surv = [k for k in surv if not pdom(a, k)]
-                    surv.append(a)
-                if surv:
-                    fr = [s for s in fr if not any(pdom(a, s) for a in surv)]
-                    fr.extend(surv)
-                return fr
-            import time as _pt
-            _gen = 0; _peak = 0; _t0 = _pt.perf_counter()
+            # Identify tokens that appear on >= 2 tools (unique tokens can never conflict)
+            tok_counts = defaultdict(int)
             for it in items:
-                ib = it.tokens; ik = {k: it.keywords.count(k) for k in reqs}
+                for t in it.tokens:
+                    tok_counts[t] += 1
+            conflict_toks = {t: (1 << b) for b, t in enumerate(
+                sorted(t for t, c in tok_counts.items() if c >= 2))}
+
+            raw_masks = []
+            for it in items:
+                m = 0
+                for t in it.tokens:
+                    bit = conflict_toks.get(t)
+                    if bit:
+                        m |= bit
+                raw_masks.append(m)
+
+            # Order items: non-conflicting (mask==0) first, then grouped by
+            # connected component of conflict tokens (smallest components first)
+            # so each token dies as early as possible.
+            non_conf = [i for i, m in enumerate(raw_masks) if m == 0]
+            conf_idxs = [i for i, m in enumerate(raw_masks) if m != 0]
+            visited = set()
+            comps = []
+            for ci in conf_idxs:
+                if ci in visited:
+                    continue
+                comp = [ci]
+                visited.add(ci)
+                cmask = raw_masks[ci]
+                changed = True
+                while changed:
+                    changed = False
+                    for cj in conf_idxs:
+                        if cj not in visited and (raw_masks[cj] & cmask):
+                            visited.add(cj)
+                            comp.append(cj)
+                            cmask |= raw_masks[cj]
+                            changed = True
+                comps.append(comp)
+            comps.sort(key=len)
+            ordered_idxs = non_conf + [i for comp in comps for i in comp]
+            ord_items = [items[i] for i in ordered_idxs]
+            ord_masks = [raw_masks[i] for i in ordered_idxs]
+            n_items = len(ord_items)
+
+            # future_mask[idx] = OR of conflict masks for all items strictly after idx
+            future_mask = [0] * n_items
+            acc_m = 0
+            for idx in range(n_items - 1, -1, -1):
+                future_mask[idx] = acc_m
+                acc_m |= ord_masks[idx]
+
+            def _make_dt(vt, kwt):
+                if has_caps:
+                    dt = (tuple(vt[ax] if cap is None or vt[ax] <= cap else cap
+                                for ax, cap in zip(max_idxs, max_caps))
+                          + tuple(-vt[ax] for ax in min_idxs)
+                          + kwt)
+                else:
+                    dt = (tuple(vt[ax] for ax in max_idxs)
+                          + tuple(-vt[ax] for ax in min_idxs)
+                          + kwt)
+                return dt, sum(dt)
+
+            def _prune_pool(sts):
+                if len(sts) <= 1:
+                    return sts
+                # s = (dt, ban, size, vt, kwt, comp, tb, dt_sum)
+                sts.sort(key=lambda s: (-s[7], s[2], -s[6]))
+                kept = []
+                for s in sts:
+                    sdt = s[0]; s_ban = s[1]; s_sz = s[2]; s_tb = s[6]; s_sum = s[7]
+                    s_nonterm = (s_sz < K)
+                    dominated = False
+                    for k in kept:
+                        if s_nonterm:
+                            if k[2] > s_sz or (k[1] & ~s_ban):
+                                continue
+                        kdt = k[0]
+                        dom = True
+                        for j in range(_PLEN):
+                            if kdt[j] < sdt[j]:
+                                dom = False
+                                break
+                        if dom:
+                            if k[6] < s_tb and kdt == sdt:
+                                continue
+                            dominated = True
+                            break
+                    if dominated:
+                        continue
+                    thr = s_sum + 1e-9
+                    new_kept = []
+                    for k in kept:
+                        if k[7] <= thr:
+                            k_sz = k[2]
+                            if not (k_sz < K and (s_sz > k_sz or (s_ban & ~k[1]))):
+                                kdt = k[0]
+                                dom = True
+                                for j in range(_PLEN):
+                                    if sdt[j] < kdt[j]:
+                                        dom = False
+                                        break
+                                if dom and not (s_tb < k[6] and sdt == kdt):
+                                    continue
+                        new_kept.append(k)
+                    new_kept.append(s)
+                    kept = new_kept
+                return kept
+
+            def _merge_pool(fr_list, add_list):
+                # fr_list is already sorted descending by dt_sum and Pareto-pruned.
+                add_list.sort(key=lambda s: (-s[7], s[2], -s[6]))
+                surv = []
+                for a in add_list:
+                    adt = a[0]; a_ban = a[1]; a_sz = a[2]; a_tb = a[6]; a_sum = a[7]
+                    a_nonterm = (a_sz < K)
+                    min_k_sum = a_sum - 1e-9
+                    dominated = False
+                    for k in fr_list:
+                        if k[7] < min_k_sum:
+                            break
+                        if a_nonterm:
+                            if k[2] > a_sz or (k[1] & ~a_ban):
+                                continue
+                        kdt = k[0]
+                        dom = True
+                        for j in range(_PLEN):
+                            if kdt[j] < adt[j]:
+                                dom = False
+                                break
+                        if dom:
+                            if k[6] < a_tb and kdt == adt:
+                                continue
+                            dominated = True
+                            break
+                    if dominated:
+                        continue
+                    for k in surv:
+                        if k[7] < min_k_sum:
+                            break
+                        if a_nonterm:
+                            if k[2] > a_sz or (k[1] & ~a_ban):
+                                continue
+                        kdt = k[0]
+                        dom = True
+                        for j in range(_PLEN):
+                            if kdt[j] < adt[j]:
+                                dom = False
+                                break
+                        if dom:
+                            if k[6] < a_tb and kdt == adt:
+                                continue
+                            dominated = True
+                            break
+                    if dominated:
+                        continue
+                    thr = a_sum + 1e-9
+                    new_surv = []
+                    for k in surv:
+                        if k[7] <= thr:
+                            k_sz = k[2]
+                            if not (k_sz < K and (a_sz > k_sz or (a_ban & ~k[1]))):
+                                kdt = k[0]
+                                dom = True
+                                for j in range(_PLEN):
+                                    if adt[j] < kdt[j]:
+                                        dom = False
+                                        break
+                                if dom and not (a_tb < k[6] and adt == kdt):
+                                    continue
+                        new_surv.append(k)
+                    new_surv.append(a)
+                    surv = new_surv
+                if not surv:
+                    return fr_list
+                # Remove any state in fr_list dominated by a state in surv
+                kept_fr = []
+                for s in fr_list:
+                    sdt = s[0]; s_ban = s[1]; s_sz = s[2]; s_tb = s[6]; s_sum = s[7]
+                    s_nonterm = (s_sz < K)
+                    min_a_sum = s_sum - 1e-9
+                    dominated = False
+                    for a in surv:
+                        if a[7] < min_a_sum:
+                            break
+                        if s_nonterm:
+                            if a[2] > s_sz or (a[1] & ~s_ban):
+                                continue
+                        adt = a[0]
+                        dom = True
+                        for j in range(_PLEN):
+                            if adt[j] < sdt[j]:
+                                dom = False
+                                break
+                        if dom:
+                            if a[6] < s_tb and adt == sdt:
+                                continue
+                            dominated = True
+                            break
+                    if not dominated:
+                        kept_fr.append(s)
+                kept_fr.extend(surv)
+                kept_fr.sort(key=lambda s: (-s[7], s[2], -s[6]))
+                return kept_fr
+
+            import time as _pt
+            z_v = (0.0,) * nax
+            z_kw = (0,) * nrk
+            z_dt, z_sum = _make_dt(z_v, z_kw)
+            fr = [(z_dt, 0, 0, z_v, z_kw, (), 0.0, z_sum)]
+            _gen = 0; _peak = 1; _t0 = _pt.perf_counter()
+            live_prev = acc_m
+            for idx, it in enumerate(ord_items):
+                ib = ord_masks[idx]
+                fmask = future_mask[idx]
+                itv = tuple(it.stats.get(a, 0.0) for a in AXES)
+                itkw = tuple(it.keywords.count(k) for k in _PRK) if nrk else z_kw
+                it_id = it.id
+                it_tb = it.tb
                 add = []
                 for st in fr:
-                    if st["size"] >= K or it.id in st["comp"] or (ib & st["ban"]):
+                    sz = st[2]
+                    if sz >= K or (ib & st[1]):
                         continue
-                    nv = {a: st["v"][a] + it.stats.get(a, 0.) for a in AXES}
-                    nkw = {k: min(st["kw"][k] + ik[k], reqs[k]) for k in reqs}
-                    add.append({"v": nv, "kw": nkw, "dt": _pdt(nv, nkw),
-                                "ban": st["ban"] | ib, "size": st["size"] + 1,
-                                "comp": st["comp"] + (it.id,), "tb": st["tb"] + it.tb})
+                    nsz = sz + 1
+                    nban = 0 if nsz >= K else ((st[1] | ib) & fmask)
+                    sv = st[3]
+                    nv = tuple(sv[j] + itv[j] for j in rng_ax)
+                    if nrk:
+                        skw = st[4]
+                        nkw = tuple(min(skw[j] + itkw[j], req_caps[j]) for j in rng_rk)
+                    else:
+                        nkw = z_kw
+                    ndt, nsum = _make_dt(nv, nkw)
+                    add.append((ndt, nban, nsz, nv, nkw, st[5] + (it_id,), st[6] + it_tb, nsum))
                 _gen += len(add)
-                if add:
-                    fr = _merge(fr, add)
+                dead_bits = live_prev & ~fmask
+                if dead_bits:
+                    # Mask dead conflict tokens out of existing fr states and re-prune
+                    fr = [(s[0], s[1] & fmask, s[2], s[3], s[4], s[5], s[6], s[7]) for s in fr]
+                    if add:
+                        fr.extend(add)
+                    fr = _prune_pool(fr)
+                elif add:
+                    fr = _merge_pool(fr, add)
+                live_prev = fmask
                 if len(fr) > _peak:
                     _peak = len(fr)
+
+            # Final ban-free & size-free Pareto prune (no more tools can be added,
+            # and tool tokens never conflict with any non-tool slot).
+            final_tups = [(s[0], s[3], s[4], s[5], s[6], s[7]) for s in fr]
+            final_tups = self._sfs_prune_tuples(final_tups)
+
             _merge_ms = (_pt.perf_counter() - _t0) * 1000.0
             if _peak > 50000:
                 print(f"[POOL-WARN] frontier peak {_peak} > 50000 on "
                       f"{getattr(self, '_cur_activity_name', '?')} — investigate objective-aware DP")
             if getattr(self, "_POOL_DIAG", False):
                 print(f"[POOL] items={len(items)} K={K} subsets_generated={_gen} "
-                      f"final_frontier={len(fr)} peak_frontier={_peak} "
+                      f"final_frontier={len(final_tups)} peak_frontier={_peak} "
                       f"merge_ms={_merge_ms:.0f}")
             out = []
-            for i, st in enumerate(fr):
+            for i, st in enumerate(final_tups):
                 pid = f"toolpool#{i}"
-                refs_pool[pid] = [refs_single[c] for c in st["comp"]]
-                kws = [k for k in reqs for _ in range(st["kw"][k])]
-                out.append(_It(pid, dict(st["v"]), kws, st["ban"], st["tb"]))
+                refs_pool[pid] = [refs_single[c] for c in st[3]]
+                kws = [k for k_i, k in enumerate(_PRK) for _ in range(st[2][k_i])] if nrk else []
+                # Empty tokens: tool mutual-exclusion was already enforced inside
+                # pool_frontier, so keeping tokens here would only block cand_capped!
+                out.append(_It(pid, dict(zip(AXES, st[1])), kws, frozenset(), st[4]))
             return out
 
         # Set-piece keyword names (for the #2 prune's set exception): any key of
@@ -1332,7 +1910,10 @@ class ExactGearsetOptimizer:
             except Exception:
                 pass
 
-        # dynamic set meta-items from gated_stats['set_pieces'] over OWNED pieces
+        # dynamic set meta-items from gated_stats['set_pieces'] over OWNED pieces.
+        # Filter out metas whose set bonus adds ZERO gain on self.AXES beyond the
+        # sum of their individual pieces (eliminates ~63-64 redundant metas per
+        # solve that otherwise bloat B&B and disable MITM).
         SLOTMAP = {"ring": "ring1", "tools": "tool0"}
         setsd = defaultdict(lambda: defaultdict(list)); thr = defaultdict(set)
         for lst in by_slot.values():
@@ -1341,8 +1922,24 @@ class ExactGearsetOptimizer:
                 if not isinstance(gs, dict) or not gs.get("set_pieces"):
                     continue
                 for sname, ths in gs["set_pieces"].items():
-                    setsd[sname][SLOTMAP.get(it.slot, it.slot)].append(it)
+                    mapped_sl = SLOTMAP.get(it.slot, it.slot)
+                    if mapped_sl == "tool0":
+                        continue
+                    setsd[sname][mapped_sl].append(it)
                     thr[sname].update(int(k) for k in ths)
+        _base_vec_cache = {}
+        def _item_base_vec(itm):
+            k = id(itm)
+            v = _base_vec_cache.get(k)
+            if v is None:
+                try:
+                    st0 = itm.get_stats_for_skill(skill=skill, location=location, character=character)
+                except Exception:
+                    st0 = {}
+                v = self._vec(st0)
+                _base_vec_cache[k] = v
+            return v
+
         metas = []
         for sname, bys in setsd.items():
             mn = min(thr[sname]) if thr[sname] else 1
@@ -1350,8 +1947,11 @@ class ExactGearsetOptimizer:
             for r in range(max(1, mn), len(sl_list) + 1):
                 for combo in itertools.combinations(sl_list, r):
                     for chosen in itertools.product(*[bys[s] for s in combo]):
-                        tot = {}; meta_tb = 0.0
+                        tot = {}; base_tot = {}; meta_tb = 0.0
                         for itm in chosen:
+                            bv = _item_base_vec(itm)
+                            for ax, val in bv.items():
+                                base_tot[ax] = base_tot.get(ax, 0.) + val
                             try:
                                 st = itm.get_stats_for_skill(skill=skill, location=location,
                                                              character=character,
@@ -1367,9 +1967,20 @@ class ExactGearsetOptimizer:
                                     meta_tb += abs(float(_sv))
                                 except (TypeError, ValueError):
                                     pass
+                        has_gain = (
+                            any(tot.get(a, 0.) > base_tot.get(a, 0.) + 1e-12 for a in self.MAX_AXES)
+                            or any(tot.get(a, 0.) < base_tot.get(a, 0.) - 1e-12 for a in self.MIN_AXES)
+                        )
+                        if not has_gain:
+                            continue
+                        meta_kws = [
+                            str(k).lower() for x in chosen
+                            for k in (getattr(x, "keywords", []) or [])
+                            if str(k).lower() in reqs
+                        ]
                         mid = f"{sname}|{r}|" + "/".join(combo)
                         refs_meta[mid] = [(combo[j], chosen[j]) for j in range(len(combo))]
-                        metas.append(_Meta(mid, list(combo), tot, [], [_item_id(x) for x in chosen], meta_tb))
+                        metas.append(_Meta(mid, list(combo), tot, meta_kws, [_item_id(x) for x in chosen], meta_tb))
 
         # ── tool frontier build with saturation-headroom caps (fc-preopt Step 2)
         # Now that base (incl service + level + collectibles + input), every
@@ -1458,12 +2069,13 @@ class ExactGearsetOptimizer:
         if getattr(self, "_GROUP_FRONTIER_DIAG", False):
             self._measure_group_frontiers(str(getattr(activity, "name", "?")), slots, reqs)
 
-        _armor = set(self.SINGLE)
-        _metas_armor_only = all(set(m.slots) <= _armor for m in metas)
-        _use_mitm = getattr(self, "_MITM_ENABLED", False) and _metas_armor_only
+        _mitm_part = self._partition_mitm_groups(slots, metas)
+        _use_mitm = (getattr(self, "_MITM_ENABLED", False)
+                     and not getattr(self, "GREEDY_SEED_ONLY", False)
+                     and (_mitm_part is not None))
         if getattr(self, "_MITM_ENABLED", False) and not _use_mitm:
             print(f"[MITM-SKIP] {getattr(activity, 'name', '?')} reqs={len(reqs)} "
-                  f"metas={len(metas)} armor_only={_metas_armor_only}")
+                  f"metas={len(metas)} partition=None")
         if _use_mitm and _fkey is not None:
             # Recipe frontier cache MISS: build the frontiers once and store them
             # (plus the reference maps needed to reconstruct the gearset) so the
