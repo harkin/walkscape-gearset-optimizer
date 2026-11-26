@@ -142,6 +142,49 @@ class ExactCoinsOptimizer(ExactGearsetOptimizer):
         return (1.0 + s["dr"] + R.get("dr", 0.)) * (
             self._C0 + s.get("A_coins", 0.0) + R.get("A_coins", 0.0))
 
+    def _make_eval_fns(self, X0, S0, kappa, WE_level, base_stats):
+        AXES = self.AXES
+        iW = AXES.index("W"); iSa = AXES.index("S_add"); iSp = AXES.index("S_pct")
+        iB = AXES.index("B"); idr = AXES.index("dr"); iAc = AXES.index("A_coins")
+        C0 = self._C0
+        step_floor = self.STEP_FLOOR
+        _ceil = math.ceil
+        step_cache = {}
+        sc_get = step_cache.get
+
+        def eval_sv(sv):
+            w = sv[iW]; sa = sv[iSa]; sp = sv[iSp]; b = sv[iB]
+            key = (w, sa, sp, b)
+            st = sc_get(key)
+            if st is None:
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
+                st = stp / (1.0 + b)
+                step_cache[key] = st
+            return ((1.0 + sv[idr]) * (C0 + sv[iAc])) / st
+
+        def eval_pair(bv, cv):
+            w = bv[iW] + cv[iW]; sa = bv[iSa] + cv[iSa]
+            sp = bv[iSp] + cv[iSp]; b = bv[iB] + cv[iB]
+            key = (w, sa, sp, b)
+            st = sc_get(key)
+            if st is None:
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
+                st = stp / (1.0 + b)
+                step_cache[key] = st
+            return ((1.0 + bv[idr] + cv[idr]) * (C0 + bv[iAc] + cv[iAc])) / st
+
+        return eval_sv, eval_sv, eval_pair
+
     def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
         """Inlined KD-blocked upper-bound-pruned coins FG × FA combine."""
         AXES = self.AXES

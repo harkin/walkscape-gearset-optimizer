@@ -377,7 +377,10 @@ class ExactGearsetOptimizer:
     # ── core branch-and-bound ────────────────────────────────────────────────
     def _optimize(self, slots, metas, X0, S0, kappa, WE_level, reqs, excl, base_stats, lambda_val=None):
         AXES = self.AXES
-        order = list(slots)
+        # Drop empty slots (no candidates and no meta referencing them) so B&B
+        # never wastes nodes/recursion on inert slots.
+        meta_slots = {sn for m in metas for sn in m.slots}
+        order = [sn for sn in slots if slots[sn] or sn in meta_slots]
         _strat = getattr(self, "SLOT_ORDER_STRATEGY", "constrained")
         _tool_ring = {"tools", "ring1", "ring2"}
 
@@ -460,33 +463,55 @@ class ExactGearsetOptimizer:
                         ex_k = dk
                 RKW[i][k] = RKW[i + 1][k] + slot_kw[i][k] + ex_k
 
-        # Per-index reserve dicts, and each candidate's stat vector in AXES order
-        # (rec's state dicts are always built in AXES order, so s.values()
-        # lines up with it) plus its (keyword, count) contributions to reqs.
-        Rs = [{a: R[a][i] for a in AXES} for i in range(n + 1)]
-        RKWi = [tuple(RKW[i][k] for k in reqs) for i in range(n + 1)]
-        req_t = tuple(reqs.items())
+        # Precompute per-index reserve tuples, keyword reserves, tb reserves,
+        # and per-candidate stat tuples in AXES order so rec() uses flat tuples
+        # with zero per-node dict allocations.
+        _add = operator.add
+        nax = len(AXES)
+        cap_idx = AXES.index(self.CAP_AXIS)
+        Rs_tup = [tuple(R[a][i] for a in AXES) for i in range(n + 1)]
+        Rs_dict = [{a: R[a][i] for a in AXES} for i in range(n + 1)]
+        rk_list = tuple(reqs)
+        nrk = len(rk_list)
+        req_caps = tuple(reqs[k] for k in rk_list)
+        RKWi = [tuple(RKW[i][k] for k in rk_list) for i in range(n + 1)]
 
-        def _prep(o):
-            kw = tuple((k, o.keywords.count(k)) for k in reqs) \
-                if any(k in o.keywords for k in reqs) else None
-            return o, tuple(o.stats.get(a, 0.) for a in AXES), kw
-        pool_full = [[_prep(it) for it in c] for c in cand]
-        pool_capped = [[_prep(it) for it in c] for c in cand_capped]
-        metas_v = [[(m, mask) + _prep(m)[1:] for m, mask in ms] for ms in metas_at]
+        # Suffix reserve of tie-breaker tb (so bound == best_r can prune when tb
+        # can't win either — prevents 5M-node stalls on zero-score plateaus).
+        slot_tb_max = [max([o.tb for o in cand[i]] + [0.0]) for i in range(n)]
+        R_tb = [0.0] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            ex_tb = 0.0
+            for m, _ in metas_at[i]:
+                d = m.tb - sum(slot_tb_max[j] for j in meta_idxs[m.id])
+                if d > ex_tb:
+                    ex_tb = d
+            R_tb[i] = R_tb[i + 1] + slot_tb_max[i] + ex_tb
+
+        def _prep_it(o):
+            itv = tuple(o.stats.get(a, 0.0) for a in AXES)
+            kwc = tuple(o.keywords.count(k) for k in rk_list) if (nrk and any(k in o.keywords for k in reqs)) else None
+            return (o, itv, kwc, o.id, o.qty, o.tb)
+
+        pool_full = [[_prep_it(it) for it in c] for c in cand]
+        pool_capped = [[_prep_it(it) for it in c] for c in cand_capped]
+        metas_v = [
+            [(m, mask, tuple(m.stats.get(a, 0.0) for a in AXES),
+              tuple(m.keywords.count(k) for k in rk_list) if (nrk and any(k in m.keywords for k in reqs)) else None,
+              "+".join(m.slots), m.id, m.component_ids, m.tb)
+             for m, mask in ms]
+            for ms in metas_at
+        ]
 
         _NEG_INF = float("-inf")
         best = {"r": _NEG_INF, "tb": _NEG_INF, "nfill": _NEG_INF, "load": None, "s": None}
         _nodes = [0]; _aborted = [False]; _seed_stop = [False]
-        cap_axis = self.CAP_AXIS
         node_budget = self.NODE_BUDGET
-        _add = operator.add
+        greedy_seed = self.GREEDY_SEED_ONLY
+        dump_active = self._dump_active
+        use_tuple_eval = (lambda_val is None)
+        eval_sv, eval_ub_sv, _ = self._make_eval_fns(X0, S0, kappa, WE_level, base_stats)
 
-        # Ring-pair permutation symmetry breaking. _pair_rA/_pair_rB are the
-        # (earlier, later) slot indices of the interchangeable ring pair;
-        # _ring_canon maps item id -> stable rank. _rA_pick tracks the earlier
-        # slot's pick while inside its subtree: None = not a single ring (meta
-        # or not yet chosen), -1 = empty, >=0 = the chosen ring's rank.
         _pair_rA = _pair_rB = -1
         _ring_canon = {}
         if self.DEDUP_RING_ORDER:
@@ -498,113 +523,98 @@ class ExactGearsetOptimizer:
                                    enumerate(sorted({it.id for it in cand[_pair_rA]}))}
                     break
         _rA_pick = [None]
+        rng_rk = range(nrk)
+        kappa_thr = kappa - 1e-12
 
-        def bound(idx, s):
-            Ri = Rs[idx]
-            if lambda_val is None:
-                return self.bound_value(X0, S0, kappa, WE_level, s, Ri)
-            # Dinkelbach subproblem: admissible upper bound on (num - lambda*steps)
-            # = upper_bound(num) - lambda * lower_bound(steps),  lambda >= 0.
-            return (self.numerator_bound(X0, s, Ri)
-                    - lambda_val * self.steps_lower_bound(S0, kappa, WE_level, s, Ri))
-
-        def rec(idx, filled, s, tally, used, ban, chosen, tb):
+        def rec(idx, filled, sv, tally, used, chosen, tb):
             if _aborted[0] or _seed_stop[0]:
                 return
             _nodes[0] += 1
             if _nodes[0] > node_budget:
                 _aborted[0] = True
                 return
-            if req_t:
+            if nrk:
                 rk = RKWi[idx]
-                for j, (k, t) in enumerate(req_t):
-                    if tally[k] + rk[j] < t:
+                for j in rng_rk:
+                    if tally[j] + rk[j] < req_caps[j]:
                         return
-            if best["r"] > _NEG_INF and bound(idx, s) < best["r"]:
-                return
-            if idx == n:
-                if lambda_val is None:
-                    r = self.score(X0, S0, kappa, WE_level, s)
+            br = best["r"]
+            if br > _NEG_INF:
+                if use_tuple_eval:
+                    ub = eval_ub_sv(tuple(map(_add, sv, Rs_tup[idx])))
                 else:
-                    r = self.numerator(X0, s) - lambda_val * self.steps(S0, kappa, WE_level, s)
-                # Plateau-dump diagnostic (ratio path only): record complete
-                # gearsets within _PLATEAU_REL_EPS of the running best. best["r"]
-                # rises monotonically, so early over-collection (vs a lower best)
-                # is filtered post-hoc; compaction keeps the list bounded.
-                if self._dump_active and lambda_val is None:
+                    s_d = dict(zip(AXES, sv))
+                    Ri = Rs_dict[idx]
+                    ub = (self.numerator_bound(X0, s_d, Ri)
+                          - lambda_val * self.steps_lower_bound(S0, kappa, WE_level, s_d, Ri))
+                if ub < br:
+                    return
+                if ub == br and tb + R_tb[idx] < best["tb"]:
+                    return
+            if idx == n:
+                if use_tuple_eval:
+                    r = eval_sv(sv)
+                else:
+                    s_d = dict(zip(AXES, sv))
+                    r = self.numerator(X0, s_d) - lambda_val * self.steps(S0, kappa, WE_level, s_d)
+                if dump_active and use_tuple_eval:
                     self._plateau_seen += 1
                     if best["r"] > _NEG_INF and r >= best["r"] * (1.0 - self._PLATEAU_REL_EPS):
                         self._plateau_hits += 1
                         self._plateau_dump.append(
-                            (r, {a: s[a] for a in AXES},
+                            (r, dict(zip(AXES, sv)),
                              [(_l, _c) for _l, _c in chosen if _c != "(empty)"]))
                         if len(self._plateau_dump) > self._PLATEAU_CAP:
                             _thr = best["r"] * (1.0 - self._PLATEAU_REL_EPS)
                             self._plateau_dump = [e for e in self._plateau_dump if e[0] >= _thr]
-                # Tie-break after (r, tb): prefer FEWER equipped pieces so a
-                # stat-neutral fill never beats an empty slot on a true tie.
                 nfill = -sum(1 for _lbl, _cid in chosen if _cid != "(empty)")
-                if (r, tb, nfill) > (best["r"], best["tb"], best["nfill"]):
+                if r > best["r"] or (r == best["r"] and (tb, nfill) > (best["tb"], best["nfill"])):
                     best["r"] = r; best["tb"] = tb; best["nfill"] = nfill
-                    best["load"] = list(chosen); best["s"] = dict(s)
-                # Fast (greedy-seed) mode: the best-first descent just produced a
-                # complete feasible gearset — its greedy per-slot pick. Stop here
-                # and return it instead of exploring the rest of the tree.
-                if self.GREEDY_SEED_ONLY and best["load"] is not None:
+                    best["load"] = list(chosen); best["s"] = dict(zip(AXES, sv))
+                if greedy_seed and best["load"] is not None:
                     _seed_stop[0] = True
                 return
             if filled & (1 << idx):
-                rec(idx + 1, filled, s, tally, used, ban, chosen, tb); return
+                rec(idx + 1, filled, sv, tally, used, chosen, tb); return
             sn = order[idx]
             is_rA = (idx == _pair_rA); is_rB = (idx == _pair_rB)
-            _pool = pool_capped[idx] if (WE_level + s[cap_axis] >= kappa - 1e-12) else pool_full[idx]
-            for it, itv, kwc in _pool:
-                if used.get(it.id, 0) >= it.qty:
+            _pool = pool_capped[idx] if (WE_level + sv[cap_idx] >= kappa_thr) else pool_full[idx]
+            bit = 1 << idx
+            for it, itv, kwc, iid, iqty, itb in _pool:
+                if used.get(iid, 0) >= iqty:
                     continue
                 if is_rB and _rA_pick[0] is not None:
-                    # Canonical order: filled ring goes in the earlier slot, and
-                    # the later slot's rank must be >= the earlier slot's. Skips
-                    # the [B,A] / [empty,A] permutation twins of kept states.
-                    if _rA_pick[0] == -1 or _ring_canon.get(it.id, -1) < _rA_pick[0]:
+                    if _rA_pick[0] == -1 or _ring_canon.get(iid, -1) < _rA_pick[0]:
                         continue
-                nt = tally
-                if kwc is not None:
-                    nt = dict(tally)
-                    for k, c in kwc:
-                        nt[k] += c
-                ns = dict(zip(AXES, map(_add, s.values(), itv)))
-                used[it.id] = used.get(it.id, 0) + 1; chosen.append((sn, it.id))
+                nt = tuple(map(_add, tally, kwc)) if kwc is not None else tally
+                nsv = tuple(map(_add, sv, itv))
+                used[iid] = used.get(iid, 0) + 1; chosen.append((sn, iid))
                 if is_rA:
-                    _prev_pick = _rA_pick[0]; _rA_pick[0] = _ring_canon.get(it.id, None)
-                rec(idx + 1, filled | (1 << idx), ns, nt, used, ban, chosen, tb + it.tb)
+                    _prev_pick = _rA_pick[0]; _rA_pick[0] = _ring_canon.get(iid, None)
+                rec(idx + 1, filled | bit, nsv, nt, used, chosen, tb + itb)
                 if is_rA:
                     _rA_pick[0] = _prev_pick
-                chosen.pop(); used[it.id] -= 1
-            for m, mask, mv, kwc in metas_v[idx]:
-                if mask & filled or any(used.get(c, 0) > 0 for c in m.component_ids):
+                chosen.pop(); used[iid] -= 1
+            for m, mask, mv, kwc, mslots_s, mid, mcids, mtb in metas_v[idx]:
+                if (mask & filled) or any(used.get(c, 0) > 0 for c in mcids):
                     continue
-                ns = dict(zip(AXES, map(_add, s.values(), mv)))
-                nt = tally
-                if kwc is not None:
-                    nt = dict(tally)
-                    for k, c in kwc:
-                        nt[k] += c
-                for c in m.component_ids:
+                nsv = tuple(map(_add, sv, mv))
+                nt = tuple(map(_add, tally, kwc)) if kwc is not None else tally
+                for c in mcids:
                     used[c] = used.get(c, 0) + 1
-                chosen.append(("+".join(m.slots), m.id))
-                rec(idx + 1, filled | mask, ns, nt, used, ban, chosen, tb + m.tb)
+                chosen.append((mslots_s, mid))
+                rec(idx + 1, filled | mask, nsv, nt, used, chosen, tb + mtb)
                 chosen.pop()
-                for c in m.component_ids:
+                for c in mcids:
                     used[c] -= 1
-            # Empty slot explored LAST (Point 4).
             if is_rA:
                 _prev_pick = _rA_pick[0]; _rA_pick[0] = -1
-            chosen.append((sn, "(empty)")); rec(idx + 1, filled, s, tally, used, ban, chosen, tb); chosen.pop()
+            chosen.append((sn, "(empty)")); rec(idx + 1, filled, sv, tally, used, chosen, tb); chosen.pop()
             if is_rA:
                 _rA_pick[0] = _prev_pick
 
-        s0 = {a: float(base_stats.get(a, 0.)) for a in AXES}
-        rec(0, 0, s0, {k: 0 for k in reqs}, {}, frozenset(), [], 0.0)
+        s0v = tuple(float(base_stats.get(a, 0.)) for a in AXES)
+        rec(0, 0, s0v, (0,) * nrk, {}, [], 0.0)
         self.last_run_budget_exhausted = bool(_aborted[0])
         self.last_run_greedy_seed = bool(_seed_stop[0])
         self._last_opt_nodes = _nodes[0]
@@ -999,6 +1009,18 @@ class ExactGearsetOptimizer:
         rk = tuple(reqs)
         nrk = len(rk)
         req_caps = tuple(reqs[k] for k in rk)
+        # Order slots inside the group: slots that supply a required keyword
+        # with min_req > 0 first (prunes infeasible states immediately), then
+        # ascending candidate count (keeps intermediate frontiers small).
+        if len(slot_defs) > 1:
+            req_needed_kws = {k for k, v in (min_req or {}).items() if v > 0}
+            def _skey(sd):
+                _lbl, cl = sd
+                sup = 0 if (req_needed_kws and any(
+                    k in it.keywords for it in cl for k in req_needed_kws)) else 1
+                return (sup, len(cl))
+            slot_defs = sorted(slot_defs, key=_skey)
+
         labels = [lbl for lbl, _ in slot_defs]
         cands = [c for _, c in slot_defs]
         idx_of = {lbl: i for i, lbl in enumerate(labels)}
@@ -1069,19 +1091,21 @@ class ExactGearsetOptimizer:
         max_caps = tuple(hv.get(a, None) for a in self.MAX_AXES)
         has_caps = any(c is not None for c in max_caps)
         n_akw = len(active_kw_idxs)
+        _add = operator.add
 
+        # Fast _make_dt avoiding per-call zip() and generator-expression frames.
+        _cap_pairs = tuple(zip(max_idxs, max_caps))
         def _make_dt(vt, kwt):
             if has_caps:
-                t_max = tuple(vt[ax] if cap is None or vt[ax] <= cap else cap
-                              for ax, cap in zip(max_idxs, max_caps))
+                dt_l = [vt[ax] if (cap is None or vt[ax] <= cap) else cap for ax, cap in _cap_pairs]
             else:
-                t_max = tuple(vt[ax] for ax in max_idxs)
-            t_min = tuple(-vt[ax] for ax in min_idxs)
+                dt_l = [vt[ax] for ax in max_idxs]
+            for ax in min_idxs:
+                dt_l.append(-vt[ax])
             if n_akw:
-                dt = t_max + t_min + tuple(kwt[j] for j in active_kw_idxs)
-            else:
-                dt = t_max + t_min
-            return dt, sum(dt)
+                for j in active_kw_idxs:
+                    dt_l.append(kwt[j])
+            return tuple(dt_l), sum(dt_l)
 
         _prune_sfs = self._sfs_prune_tuples
 
@@ -1148,7 +1172,7 @@ class ExactGearsetOptimizer:
                             continue
                     else:
                         nkw = z_kw
-                    nv = tuple(sv[j] + itv[j] for j in rng_ax)
+                    nv = tuple(map(_add, sv, itv))
                     ndt, nsum = _make_dt(nv, nkw)
                     nu = _uinc(sused, (it.id,)) if need_used else sused
                     nxt.append((ndt, nv, nkw, scomp + ((label, it.id),),
@@ -1162,7 +1186,7 @@ class ExactGearsetOptimizer:
                             continue
                     else:
                         nkw = z_kw
-                    nv = tuple(sv[j] + mv[j] for j in rng_ax)
+                    nv = tuple(map(_add, sv, mv))
                     ndt, nsum = _make_dt(nv, nkw)
                     nu = _uinc(sused, m.component_ids)
                     nxt.append((ndt, nv, nkw, scomp + (("+".join(m.slots), m.id),),
@@ -1242,24 +1266,39 @@ class ExactGearsetOptimizer:
                     return None
         return (g_slots, g_metas), (t_slots, t_metas), (r_slots, r_metas)
 
+    def _make_eval_fns(self, X0, S0, kappa, WE_level, base_stats):
+        """Return (eval_sv, eval_ub_sv, eval_pair) operating on flat AXES-ordered
+        stat tuples. Subclasses override with inlined scalar arithmetic and
+        step/qp caching; this base implementation works for any custom subclass."""
+        AXES = self.AXES
+        _add = operator.add
+        _score = self.score
+
+        def eval_sv(sv):
+            return _score(X0, S0, kappa, WE_level, dict(zip(AXES, sv)))
+
+        def eval_pair(bv, cv):
+            return _score(X0, S0, kappa, WE_level, dict(zip(AXES, map(_add, bv, cv))))
+
+        return eval_sv, eval_sv, eval_pair
+
     def _optimize_mitm(self, slots, metas, reqs, X0, S0, kappa, WE_level, base_stats):
         """Meet-in-the-middle: collapse 3 disjoint groups to Pareto frontiers
-        with saturation headroom caps, dynamically merge the smallest pair, then
-        combine with KD-blocked upper-bound pruning."""
+        with saturation headroom caps, then run 3-way iterative objective-bound
+        pre-pruning + direct 3-way / dual-tree KD-block combine (skipping
+        expensive unpruned pairwise Pareto merges)."""
         reqs = reqs or {}
-        fr = self._mitm_frontiers(slots, metas, reqs, kappa=kappa,
-                                  WE_level=WE_level, base_stats=base_stats)
+        fr = self._mitm_frontiers_3way(slots, metas, reqs, kappa=kappa,
+                                       WE_level=WE_level, base_stats=base_stats)
         if fr is None:
             return float("-inf"), None, None
-        F1, _FT, _FR, F2 = fr
-        return self._combine_best(F1, F2, reqs, X0, S0, kappa, WE_level, base_stats)
+        FG, FT, FR = fr
+        return self._combine_3way(FG, FT, FR, reqs, X0, S0, kappa, WE_level, base_stats)
 
-    def _mitm_frontiers(self, slots, metas, reqs, kappa=None, WE_level=0.0, base_stats=None):
-        """Build the MITM Pareto frontiers for `slots` + `metas`. When `kappa`
-        and `base_stats` are provided, applies exact per-group saturation
-        headroom caps and dynamically merges the smallest pair among (FG, FT, FR).
-        Returns (F1, FT, FR, F2) where (F1, F2) are the two frontiers to combine,
-        or None to bail."""
+    def _mitm_frontiers_3way(self, slots, metas, reqs, kappa=None, WE_level=0.0, base_stats=None):
+        """Build the 3 disjoint group Pareto frontiers (FG, FT, FR) with exact
+        saturation headroom caps and per-group minimum keyword obligations.
+        Returns (FG, FT, FR) or None if infeasible or unpartitionable."""
         reqs = reqs or {}
         part = self._partition_mitm_groups(slots, metas)
         if part is None:
@@ -1275,8 +1314,6 @@ class ExactGearsetOptimizer:
         hr_t = self._compute_headroom(kappa, base_stats, WE_level, g_lists + r_lists, g_metas + r_metas) if use_hr else None
         hr_r = self._compute_headroom(kappa, base_stats, WE_level, g_lists + t_lists, g_metas + t_metas) if use_hr else None
 
-        # Per-group max keyword supply upper bounds -> per-group minimum keyword
-        # obligations so _group_collapse drops infeasible branches early.
         min_req_g = min_req_t = min_req_r = None
         if reqs:
             def _grp_max_kw(s_lists, g_ms):
@@ -1285,7 +1322,6 @@ class ExactGearsetOptimizer:
                     tot = 0
                     for lst in s_lists:
                         tot += max([it.keywords.count(k) for it in lst] + [0])
-                    # Conservative meta excess
                     for m in g_ms:
                         mk = m.keywords.count(k)
                         if mk > 0:
@@ -1311,6 +1347,281 @@ class ExactGearsetOptimizer:
         FR = self._group_collapse([(sl, slots.get(sl, [])) for sl in r_slots], r_metas, reqs, headroom=hr_r, min_req=min_req_r)
         if not FR:
             return None
+        return (FG, FT, FR)
+
+    def _combine_3way(self, FG, FT, FR, reqs, X0, S0, kappa, WE_level, base_stats):
+        """Exact 3-way combine of (FG, FT, FR) using:
+          1. Iterative 3-way objective-bound pre-pruning (eliminates 80-98% of
+             all three frontiers before any pairwise/3-way search).
+          2. Adaptive final combine:
+             - When the two smallest surviving groups have product <= 512, form
+               their filtered pairs on the fly and run Dual-Tree KD-block combine.
+             - Otherwise run direct 3-level Dual-Tree KD-block branch-and-bound
+               (zero unpruned Pareto merge overhead)."""
+        AXES = self.AXES
+        nax = len(AXES)
+        _add = operator.add
+        s0v = tuple(float(base_stats.get(a, 0.0)) for a in AXES)
+        max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
+        min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
+        rk = tuple(reqs)
+        nrk = len(rk)
+        req_caps = tuple(reqs[k] for k in rk)
+        has_reqs = nrk > 0
+        rng_rk = range(nrk)
+
+        def _extract(fr):
+            out = []
+            for st in fr:
+                vt = st.get("vt")
+                if vt is None:
+                    v = st["v"]; vt = tuple(v[a] for a in AXES)
+                kwt = st.get("kwt")
+                if kwt is None:
+                    kw = st["kw"]; kwt = tuple(kw[k] for k in rk) if has_reqs else ()
+                comp = st["comp"]
+                out.append((vt, kwt, -len(comp), st.get("tb", 0.0), comp))
+            return out
+
+        G = _extract(FG); T = _extract(FT); R = _extract(FR)
+        if not G or not T or not R:
+            return float("-inf"), None, None
+
+        def _kw_max(lst):
+            return tuple(max(x[1][j] for x in lst) for j in rng_rk)
+
+        if has_reqs:
+            for _ in range(2):
+                mG, mT, mR = _kw_max(G), _kw_max(T), _kw_max(R)
+                if any(mG[j] + mT[j] + mR[j] < req_caps[j] for j in rng_rk):
+                    return float("-inf"), None, None
+                G = [x for x in G if all(x[1][j] + mT[j] + mR[j] >= req_caps[j] for j in rng_rk)]
+                if not G:
+                    return float("-inf"), None, None
+                T = [x for x in T if all(mG[j] + x[1][j] + mR[j] >= req_caps[j] for j in rng_rk)]
+                if not T:
+                    return float("-inf"), None, None
+                R = [x for x in R if all(mG[j] + mT[j] + x[1][j] >= req_caps[j] for j in rng_rk)]
+                if not R:
+                    return float("-inf"), None, None
+
+        eval_sv, eval_ub_sv, eval_pair = self._make_eval_fns(X0, S0, kappa, WE_level, base_stats)
+
+        def _box(lst):
+            b = [0.0] * nax
+            for j in max_idxs:
+                mx = lst[0][0][j]
+                for x in lst:
+                    v = x[0][j]
+                    if v > mx:
+                        mx = v
+                b[j] = mx
+            for j in min_idxs:
+                mn = lst[0][0][j]
+                for x in lst:
+                    v = x[0][j]
+                    if v < mn:
+                        mn = v
+                b[j] = mn
+            return tuple(b)
+
+        def _attach_ub(lst, other_sum):
+            return [(*x[:5], eval_ub_sv(tuple(map(_add, other_sum, x[0])))) for x in lst]
+
+        boxG, boxT, boxR = _box(G), _box(T), _box(R)
+        s0_TR = tuple(map(_add, s0v, map(_add, boxT, boxR)))
+        s0_GR = tuple(map(_add, s0v, map(_add, boxG, boxR)))
+        s0_GT = tuple(map(_add, s0v, map(_add, boxG, boxT)))
+        G = _attach_ub(G, s0_TR); G.sort(key=lambda x: x[5], reverse=True)
+        T = _attach_ub(T, s0_GR); T.sort(key=lambda x: x[5], reverse=True)
+        R = _attach_ub(R, s0_GT); R.sort(key=lambda x: x[5], reverse=True)
+
+        best_r = float("-inf"); best_tb = float("-inf"); best_nfill = float("-inf")
+        best_load = None; best_sv = None
+
+        # Quick seed from top-8 x top-8 x top-8 (plus keyword-heavy fallback if reqs)
+        seed_G = G[:8]; seed_T = T[:8]; seed_R = R[:8]
+        if has_reqs:
+            sg_kw = sorted(G, key=lambda x: (sum(x[1]), x[5]), reverse=True)[:4]
+            st_kw = sorted(T, key=lambda x: (sum(x[1]), x[5]), reverse=True)[:4]
+            sr_kw = sorted(R, key=lambda x: (sum(x[1]), x[5]), reverse=True)[:4]
+            seed_G = seed_G + [x for x in sg_kw if x not in seed_G]
+            seed_T = seed_T + [x for x in st_kw if x not in seed_T]
+            seed_R = seed_R + [x for x in sr_kw if x not in seed_R]
+
+        for gv, kG, nfG, tbG, cG, _ in seed_G:
+            s0g = tuple(map(_add, s0v, gv))
+            for tv, kT, nfT, tbT, cT, _ in seed_T:
+                s0gt = tuple(map(_add, s0g, tv))
+                for rv, kR, nfR, tbR, cR, _ in seed_R:
+                    if has_reqs and any(kG[j] + kT[j] + kR[j] < req_caps[j] for j in rng_rk):
+                        continue
+                    r = eval_pair(s0gt, rv)
+                    if r >= best_r:
+                        tb = tbG + tbT + tbR; nf = nfG + nfT + nfR
+                        if r > best_r or (tb, nf) > (best_tb, best_nfill):
+                            best_r = r; best_tb = tb; best_nfill = nf
+                            best_load = list(cG) + list(cT) + list(cR)
+                            best_sv = tuple(map(_add, s0gt, rv))
+
+        # Iterative 3-way objective-bound tightening (up to 3 rounds)
+        if best_load is not None:
+            for _rnd in range(3):
+                prev_tot = len(G) + len(T) + len(R)
+                eps_r = best_r / (1.0 + 1e-12) if best_r > 0 else best_r * (1.0 + 1e-12)
+                G = [x for x in G if x[5] >= eps_r]
+                T = [x for x in T if x[5] >= eps_r]
+                R = [x for x in R if x[5] >= eps_r]
+                if not G or not T or not R:
+                    return best_r, best_load, dict(zip(AXES, best_sv))
+                cur_tot = len(G) + len(T) + len(R)
+                if _rnd < 2 and cur_tot <= int(prev_tot * 0.85):
+                    boxG, boxT, boxR = _box(G), _box(T), _box(R)
+                    s0_TR = tuple(map(_add, s0v, map(_add, boxT, boxR)))
+                    s0_GR = tuple(map(_add, s0v, map(_add, boxG, boxR)))
+                    s0_GT = tuple(map(_add, s0v, map(_add, boxG, boxT)))
+                    G = _attach_ub(G, s0_TR); G.sort(key=lambda x: x[5], reverse=True)
+                    T = _attach_ub(T, s0_GR); T.sort(key=lambda x: x[5], reverse=True)
+                    R = _attach_ub(R, s0_GT); R.sort(key=lambda x: x[5], reverse=True)
+                else:
+                    break
+
+        # Order surviving groups ascending by size: len(A) <= len(B) <= len(C)
+        groups_sorted = sorted((G, T, R), key=len)
+        A, B, C = groups_sorted
+
+        if len(A) * len(B) <= 512:
+            # Small A*B: build filtered AB directly (zero Pareto overhead) and
+            # run Dual-Tree KD-block combine against C.
+            boxC = _box(C)
+            s0_C = tuple(map(_add, s0v, boxC))
+            mC = _kw_max(C) if has_reqs else ()
+            AB = []
+            for av, kA, nfA, tbA, cA, _ in A:
+                for bv, kB, nfB, tbB, cB, _ in B:
+                    if has_reqs:
+                        ok = True
+                        for j in rng_rk:
+                            if kA[j] + kB[j] + mC[j] < req_caps[j]:
+                                ok = False
+                                break
+                        if not ok:
+                            continue
+                        kAB = tuple(min(kA[j] + kB[j], req_caps[j]) for j in rng_rk)
+                    else:
+                        kAB = ()
+                    abv = tuple(map(_add, av, bv))
+                    ub = eval_ub_sv(tuple(map(_add, s0_C, abv)))
+                    if best_load is not None and ub * (1.0 + 1e-12) < best_r:
+                        continue
+                    AB.append((abv, kAB, nfA + nfB, tbA + tbB, cA + cB, ub))
+            if not AB:
+                if best_load is None:
+                    return float("-inf"), None, None
+                return best_r, best_load, dict(zip(AXES, best_sv))
+
+            blocks_AB = self._build_kd_blocks(AB, max_idxs, min_idxs, has_reqs, nrk, leaf_size=24)
+            blocks_C = self._build_kd_blocks(C, max_idxs, min_idxs, has_reqs, nrk, leaf_size=24)
+
+            for ab_box, ab_kw, ab_items in blocks_AB:
+                s0_ab_box = tuple(map(_add, s0v, ab_box))
+                for c_box, c_kw, c_items in blocks_C:
+                    if has_reqs and any(ab_kw[j] + c_kw[j] < req_caps[j] for j in rng_rk):
+                        continue
+                    if best_load is not None:
+                        if eval_ub_sv(tuple(map(_add, s0_ab_box, c_box))) * (1.0 + 1e-12) < best_r:
+                            continue
+                    for abv, kAB, nfAB, tbAB, cAB, ubAB in ab_items:
+                        if best_load is not None and ubAB * (1.0 + 1e-12) < best_r:
+                            continue
+                        if has_reqs and any(kAB[j] + c_kw[j] < req_caps[j] for j in rng_rk):
+                            continue
+                        s0_ab = tuple(map(_add, s0v, abv))
+                        if best_load is not None:
+                            if eval_ub_sv(tuple(map(_add, s0_ab, c_box))) * (1.0 + 1e-12) < best_r:
+                                continue
+                        for cv, kC, nfC, tbC, cC, _ in c_items:
+                            if has_reqs and any(kAB[j] + kC[j] < req_caps[j] for j in rng_rk):
+                                continue
+                            r = eval_pair(s0_ab, cv)
+                            if r >= best_r:
+                                tb = tbAB + tbC; nf = nfAB + nfC
+                                if r > best_r or (tb, nf) > (best_tb, best_nfill):
+                                    best_r = r; best_tb = tb; best_nfill = nf
+                                    best_load = list(cAB) + list(cC)
+                                    best_sv = tuple(map(_add, s0_ab, cv))
+        else:
+            # Direct 3-level Dual-Tree KD-block branch-and-bound (zero merge!)
+            boxC = _box(C)
+            mC = _kw_max(C) if has_reqs else ()
+            blocks_A = self._build_kd_blocks(A, max_idxs, min_idxs, has_reqs, nrk, leaf_size=16)
+            blocks_B = self._build_kd_blocks(B, max_idxs, min_idxs, has_reqs, nrk, leaf_size=24)
+            blocks_C = self._build_kd_blocks(C, max_idxs, min_idxs, has_reqs, nrk, leaf_size=24)
+
+            for a_box, a_kw, a_items in blocks_A:
+                s0_a_box = tuple(map(_add, s0v, a_box))
+                for b_box, b_kw, b_items in blocks_B:
+                    if has_reqs and any(a_kw[j] + b_kw[j] + mC[j] < req_caps[j] for j in rng_rk):
+                        continue
+                    s0_ab_box = tuple(map(_add, s0_a_box, b_box))
+                    if best_load is not None:
+                        if eval_ub_sv(tuple(map(_add, s0_ab_box, boxC))) * (1.0 + 1e-12) < best_r:
+                            continue
+                    for c_box, c_kw, c_items in blocks_C:
+                        if has_reqs and any(a_kw[j] + b_kw[j] + c_kw[j] < req_caps[j] for j in rng_rk):
+                            continue
+                        if best_load is not None:
+                            if eval_ub_sv(tuple(map(_add, s0_ab_box, c_box))) * (1.0 + 1e-12) < best_r:
+                                continue
+                        bc_box = tuple(map(_add, b_box, c_box))
+                        for av, kA, nfA, tbA, cA, ubA in a_items:
+                            if best_load is not None and ubA * (1.0 + 1e-12) < best_r:
+                                continue
+                            if has_reqs and any(kA[j] + b_kw[j] + c_kw[j] < req_caps[j] for j in rng_rk):
+                                continue
+                            s0_a = tuple(map(_add, s0v, av))
+                            if best_load is not None:
+                                if eval_ub_sv(tuple(map(_add, s0_a, bc_box))) * (1.0 + 1e-12) < best_r:
+                                    continue
+                            for bv, kB, nfB, tbB, cB, ubB in b_items:
+                                if best_load is not None and ubB * (1.0 + 1e-12) < best_r:
+                                    continue
+                                if has_reqs and any(kA[j] + kB[j] + c_kw[j] < req_caps[j] for j in rng_rk):
+                                    continue
+                                s0_ab = tuple(map(_add, s0_a, bv))
+                                if best_load is not None:
+                                    if eval_ub_sv(tuple(map(_add, s0_ab, c_box))) * (1.0 + 1e-12) < best_r:
+                                        continue
+                                nfAB = nfA + nfB; tbAB = tbA + tbB
+                                for cv, kC, nfC, tbC, cC, _ in c_items:
+                                    if has_reqs and any(kA[j] + kB[j] + kC[j] < req_caps[j] for j in rng_rk):
+                                        continue
+                                    r = eval_pair(s0_ab, cv)
+                                    if r >= best_r:
+                                        tb = tbAB + tbC; nf = nfAB + nfC
+                                        if r > best_r or (tb, nf) > (best_tb, best_nfill):
+                                            best_r = r; best_tb = tb; best_nfill = nf
+                                            best_load = list(cA) + list(cB) + list(cC)
+                                            best_sv = tuple(map(_add, s0_ab, cv))
+
+        if best_load is None:
+            return float("-inf"), None, None
+        return best_r, best_load, dict(zip(AXES, best_sv))
+
+    def _mitm_frontiers(self, slots, metas, reqs, kappa=None, WE_level=0.0, base_stats=None):
+        """Legacy 2-way merged frontiers (used by recipe-chest _frontier_cache)."""
+        reqs = reqs or {}
+        fr3 = self._mitm_frontiers_3way(slots, metas, reqs, kappa=kappa,
+                                        WE_level=WE_level, base_stats=base_stats)
+        if fr3 is None:
+            return None
+        FG, FT, FR = fr3
+        part = self._partition_mitm_groups(slots, metas)
+        (g_slots, g_metas), (t_slots, t_metas), (r_slots, r_metas) = part
+        use_hr = (kappa is not None and base_stats is not None)
+        g_lists = [slots.get(sl, []) for sl in g_slots]
+        t_lists = [slots.get(sl, []) for sl in t_slots]
+        r_lists = [slots.get(sl, []) for sl in r_slots]
 
         # Dynamic 2-way merge order: pick the pair with the smallest product!
         p_tr = len(FT) * len(FR)
@@ -1736,11 +2047,11 @@ class ExactGearsetOptimizer:
             )
             _mhit = _mcache.get(_mkey)
             if _mhit is not None:
-                _F1, _F2, _rs, _rm, _rp, _nt = _mhit
+                _FGc, _FTc, _FRc, _rs, _rm, _rp, _nt = _mhit
                 self._last_opt_nodes = 0
-                if _F1 is None:
+                if _FGc is None:
                     return None
-                _r, _load, _s = self._combine_best(_F1, _F2, reqs, X0, S0, kappa, WE_level, _base_pre)
+                _r, _load, _s = self._combine_3way(_FGc, _FTc, _FRc, reqs, X0, S0, kappa, WE_level, _base_pre)
                 if _load is None:
                     return None
                 return self._reconstruct_gearset(_load, _rs, _rm, _rp, _nt)
@@ -1830,7 +2141,9 @@ class ExactGearsetOptimizer:
               4. Flat-tuple SFS (Sort-Filter-Skyline) Pareto merge.
               5. Final ban-free & size-free Pareto prune with empty output
                  tokens (tool tokens never affect any non-tool slot)."""
-            _PMAXA = self.MAX_AXES; _PMINA = self.MIN_AXES; _PRK = tuple(reqs)
+            _PMAXA = self.MAX_AXES; _PMINA = self.MIN_AXES
+            # Only track req keywords actually carried by >=1 tool in `items`
+            _PRK = tuple(k for k in reqs if any(k in it.keywords for it in items))
             nax = len(AXES)
             nrk = len(_PRK)
             req_caps = tuple(reqs[k] for k in _PRK)
@@ -1840,7 +2153,8 @@ class ExactGearsetOptimizer:
             max_caps = tuple(_HV.get(a, None) for a in _PMAXA)
             has_caps = any(c is not None for c in max_caps)
             _PLEN = len(max_idxs) + len(min_idxs) + nrk
-            rng_ax = range(nax)
+            _add = operator.add
+            _cap_pairs = tuple(zip(max_idxs, max_caps))
             rng_rk = range(nrk)
 
             # Identify tokens that appear on >= 2 tools (unique tokens can never conflict)
@@ -1898,19 +2212,48 @@ class ExactGearsetOptimizer:
 
             def _make_dt(vt, kwt):
                 if has_caps:
-                    dt = (tuple(vt[ax] if cap is None or vt[ax] <= cap else cap
-                                for ax, cap in zip(max_idxs, max_caps))
-                          + tuple(-vt[ax] for ax in min_idxs)
-                          + kwt)
+                    dt_l = [vt[ax] if (cap is None or vt[ax] <= cap) else cap for ax, cap in _cap_pairs]
                 else:
-                    dt = (tuple(vt[ax] for ax in max_idxs)
-                          + tuple(-vt[ax] for ax in min_idxs)
-                          + kwt)
-                return dt, sum(dt)
+                    dt_l = [vt[ax] for ax in max_idxs]
+                for ax in min_idxs:
+                    dt_l.append(-vt[ax])
+                if nrk:
+                    dt_l.extend(kwt)
+                return tuple(dt_l), sum(dt_l)
+
+            def _dt_ge(da, db):
+                if _PLEN == 6:
+                    return (da[0] >= db[0] and da[1] >= db[1] and da[2] >= db[2]
+                            and da[3] >= db[3] and da[4] >= db[4] and da[5] >= db[5])
+                if _PLEN == 7:
+                    return (da[0] >= db[0] and da[1] >= db[1] and da[2] >= db[2]
+                            and da[3] >= db[3] and da[4] >= db[4] and da[5] >= db[5]
+                            and da[6] >= db[6])
+                if _PLEN == 5:
+                    return (da[0] >= db[0] and da[1] >= db[1] and da[2] >= db[2]
+                            and da[3] >= db[3] and da[4] >= db[4])
+                if _PLEN == 8:
+                    return (da[0] >= db[0] and da[1] >= db[1] and da[2] >= db[2]
+                            and da[3] >= db[3] and da[4] >= db[4] and da[5] >= db[5]
+                            and da[6] >= db[6] and da[7] >= db[7])
+                for j in range(_PLEN):
+                    if da[j] < db[j]:
+                        return False
+                return True
 
             def _prune_pool(sts):
                 if len(sts) <= 1:
                     return sts
+                # O(1) exact (dt, ban, size) dedup keeping highest tb
+                by_key = {}
+                for s in sts:
+                    key = (s[0], s[1], s[2])
+                    prev = by_key.get(key)
+                    if prev is None or s[6] > prev[6]:
+                        by_key[key] = s
+                if len(by_key) <= 1:
+                    return list(by_key.values())
+                sts = list(by_key.values())
                 # s = (dt, ban, size, vt, kwt, comp, tb, dt_sum)
                 sts.sort(key=lambda s: (-s[7], s[2], -s[6]))
                 kept = []
@@ -1923,12 +2266,7 @@ class ExactGearsetOptimizer:
                             if k[2] > s_sz or (k[1] & ~s_ban):
                                 continue
                         kdt = k[0]
-                        dom = True
-                        for j in range(_PLEN):
-                            if kdt[j] < sdt[j]:
-                                dom = False
-                                break
-                        if dom:
+                        if _dt_ge(kdt, sdt):
                             if k[6] < s_tb and kdt == sdt:
                                 continue
                             dominated = True
@@ -1943,12 +2281,7 @@ class ExactGearsetOptimizer:
                             k_sz = k[2]
                             if not (k_sz < K and (s_sz > k_sz or (s_ban & ~k[1]))):
                                 kdt = k[0]
-                                dom = True
-                                for j in range(_PLEN):
-                                    if sdt[j] < kdt[j]:
-                                        dom = False
-                                        break
-                                if dom and not (s_tb < k[6] and sdt == kdt):
+                                if _dt_ge(sdt, kdt) and not (s_tb < k[6] and sdt == kdt):
                                     del kept[p]
                             p -= 1
                     kept.append(s)
@@ -1956,6 +2289,14 @@ class ExactGearsetOptimizer:
 
             def _merge_pool(fr_list, add_list):
                 # fr_list is already sorted descending by dt_sum and Pareto-pruned.
+                # O(1) exact (dt, ban, size) dedup on add_list before merging.
+                by_key = {}
+                for s in add_list:
+                    key = (s[0], s[1], s[2])
+                    prev = by_key.get(key)
+                    if prev is None or s[6] > prev[6]:
+                        by_key[key] = s
+                add_list = list(by_key.values())
                 add_list.sort(key=lambda s: (-s[7], s[2], -s[6]))
                 surv = []
                 for a in add_list:
@@ -1970,12 +2311,7 @@ class ExactGearsetOptimizer:
                             if k[2] > a_sz or (k[1] & ~a_ban):
                                 continue
                         kdt = k[0]
-                        dom = True
-                        for j in range(_PLEN):
-                            if kdt[j] < adt[j]:
-                                dom = False
-                                break
-                        if dom:
+                        if _dt_ge(kdt, adt):
                             if k[6] < a_tb and kdt == adt:
                                 continue
                             dominated = True
@@ -1989,12 +2325,7 @@ class ExactGearsetOptimizer:
                             if k[2] > a_sz or (k[1] & ~a_ban):
                                 continue
                         kdt = k[0]
-                        dom = True
-                        for j in range(_PLEN):
-                            if kdt[j] < adt[j]:
-                                dom = False
-                                break
-                        if dom:
+                        if _dt_ge(kdt, adt):
                             if k[6] < a_tb and kdt == adt:
                                 continue
                             dominated = True
@@ -2009,12 +2340,7 @@ class ExactGearsetOptimizer:
                             k_sz = k[2]
                             if not (k_sz < K and (a_sz > k_sz or (a_ban & ~k[1]))):
                                 kdt = k[0]
-                                dom = True
-                                for j in range(_PLEN):
-                                    if adt[j] < kdt[j]:
-                                        dom = False
-                                        break
-                                if dom and not (a_tb < k[6] and adt == kdt):
+                                if _dt_ge(adt, kdt) and not (a_tb < k[6] and adt == kdt):
                                     del surv[p]
                             p -= 1
                     surv.append(a)
@@ -2034,12 +2360,7 @@ class ExactGearsetOptimizer:
                             if a[2] > s_sz or (a[1] & ~s_ban):
                                 continue
                         adt = a[0]
-                        dom = True
-                        for j in range(_PLEN):
-                            if adt[j] < sdt[j]:
-                                dom = False
-                                break
-                        if dom:
+                        if _dt_ge(adt, sdt):
                             if a[6] < s_tb and adt == sdt:
                                 continue
                             dominated = True
@@ -2072,7 +2393,7 @@ class ExactGearsetOptimizer:
                     nsz = sz + 1
                     nban = 0 if nsz >= K else ((st[1] | ib) & fmask)
                     sv = st[3]
-                    nv = tuple(sv[j] + itv[j] for j in rng_ax)
+                    nv = tuple(map(_add, sv, itv))
                     if nrk:
                         skw = st[4]
                         nkw = tuple(min(skw[j] + itkw[j], req_caps[j]) for j in rng_rk)
@@ -2299,7 +2620,7 @@ class ExactGearsetOptimizer:
                     _max_sup += sum(_tks[:_nt_cap])
                 if _max_sup < _rneed:
                     if _mkey is not None:
-                        _mcache[_mkey] = (None, None, None, None, None, 0)
+                        _mcache[_mkey] = (None, None, None, None, None, None, 0)
                     return None
         _HV = {}
         for _ax, _cap in _sat_caps.items():
@@ -2392,13 +2713,13 @@ class ExactGearsetOptimizer:
         elif _use_mitm:
             import time as _t
             _t0 = _t.perf_counter()
-            _fr_m = self._mitm_frontiers(slots, metas, reqs, kappa=kappa,
-                                         WE_level=WE_level, base_stats=base)
+            _fr_m = self._mitm_frontiers_3way(slots, metas, reqs, kappa=kappa,
+                                              WE_level=WE_level, base_stats=base)
             if _fr_m is not None:
-                _F1m, _FTm, _FRm, _F2m = _fr_m
+                _FGm, _FTm, _FRm = _fr_m
                 if _mkey is not None:
-                    _mcache[_mkey] = (_F1m, _F2m, refs_single, refs_meta, refs_pool, n_tools)
-                r_m, load_m, _sm = self._combine_best(_F1m, _F2m, reqs, X0, S0, kappa, WE_level, base)
+                    _mcache[_mkey] = (_FGm, _FTm, _FRm, refs_single, refs_meta, refs_pool, n_tools)
+                r_m, load_m, _sm = self._combine_3way(_FGm, _FTm, _FRm, reqs, X0, S0, kappa, WE_level, base)
             else:
                 r_m, load_m, _sm = float("-inf"), None, None
             _tm = (_t.perf_counter() - _t0) * 1000.0

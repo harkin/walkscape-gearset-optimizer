@@ -217,6 +217,120 @@ class ExactCraftStepsOptimizer(ExactGearsetOptimizer):
             caps["nmc"] = 0.99
         return caps
 
+    def _make_eval_fns(self, X0, S0, kappa, WE_level, base_stats):
+        """Inlined tuple evaluators (eval_sv, eval_ub_sv, eval_pair) for craft
+        steps with direct step_cache and qp_cache dict lookups."""
+        AXES = self.AXES
+        iW = AXES.index("W"); iSa = AXES.index("S_add")
+        iSp = AXES.index("S_pct"); iB = AXES.index("B"); idr = AXES.index("dr")
+        has_nmc = "nmc" in AXES
+        inmc = AXES.index("nmc") if has_nmc else -1
+        has_qo = self._apply_quality and ("qo" in AXES)
+        iqo = AXES.index("qo") if has_qo else -1
+        oq_inv = 1.0 / self._oq_plus_if
+        mat0 = self._mat_per_output0
+        step_floor = self.STEP_FLOOR
+        _ceil = math.ceil
+        _qp = self._qp
+        qp_cache = self._qp_cache
+        qp_get = qp_cache.get
+        lb_qo = self._level_bonus_qo
+        qp_peak400 = _qp(400.0 - lb_qo) if has_qo else 1.0
+        step_cache = {}
+        sc_get = step_cache.get
+
+        def eval_sv(sv):
+            dr = sv[idr]
+            dr_c = 1.0 if dr > 1.0 else (0.0 if dr < 0.0 else dr)
+            if has_qo:
+                qo = sv[iqo]
+                p = qp_get(qo)
+                if p is None:
+                    p = _qp(qo)
+                num = (1.0 + dr_c) * p
+            else:
+                num = 1.0 + dr_c
+            w = sv[iW]; sa = sv[iSa]; sp = sv[iSp]; b = sv[iB]
+            key = (w, sa, sp, b)
+            st = sc_get(key)
+            if st is None:
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
+                st = (stp / (1.0 + b)) * oq_inv
+                step_cache[key] = st
+            if has_nmc:
+                nmc = sv[inmc]
+                nmc_c = 0.99 if nmc > 0.99 else (0.0 if nmc < 0.0 else nmc)
+                st += (1.0 - nmc_c) * mat0
+            return num / st
+
+        def eval_ub_sv(sv):
+            dr = sv[idr]
+            dr_c = 1.0 if dr > 1.0 else (0.0 if dr < 0.0 else dr)
+            if has_qo:
+                qo = sv[iqo]
+                p = qp_get(qo)
+                if p is None:
+                    p = _qp(qo)
+                if qo + lb_qo > 400.0 and qp_peak400 > p:
+                    p = qp_peak400
+                num = (1.0 + dr_c) * p
+            else:
+                num = 1.0 + dr_c
+            w = sv[iW]; sa = sv[iSa]; sp = sv[iSp]; b = sv[iB]
+            key = (w, sa, sp, b)
+            st = sc_get(key)
+            if st is None:
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
+                st = (stp / (1.0 + b)) * oq_inv
+                step_cache[key] = st
+            if has_nmc:
+                nmc = sv[inmc]
+                nmc_c = 0.99 if nmc > 0.99 else (0.0 if nmc < 0.0 else nmc)
+                st += (1.0 - nmc_c) * mat0
+            return num / st
+
+        def eval_pair(bv, cv):
+            dr = bv[idr] + cv[idr]
+            dr_c = 1.0 if dr > 1.0 else (0.0 if dr < 0.0 else dr)
+            if has_qo:
+                qo = bv[iqo] + cv[iqo]
+                p = qp_get(qo)
+                if p is None:
+                    p = _qp(qo)
+                num = (1.0 + dr_c) * p
+            else:
+                num = 1.0 + dr_c
+            w = bv[iW] + cv[iW]; sa = bv[iSa] + cv[iSa]
+            sp = bv[iSp] + cv[iSp]; b = bv[iB] + cv[iB]
+            key = (w, sa, sp, b)
+            st = sc_get(key)
+            if st is None:
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
+                st = (stp / (1.0 + b)) * oq_inv
+                step_cache[key] = st
+            if has_nmc:
+                nmc = bv[inmc] + cv[inmc]
+                nmc_c = 0.99 if nmc > 0.99 else (0.0 if nmc < 0.0 else nmc)
+                st += (1.0 - nmc_c) * mat0
+            return num / st
+
+        return eval_sv, eval_ub_sv, eval_pair
+
     def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
         """Inlined KD-blocked upper-bound-pruned MITM combine for craft steps.
         Proves global optimality without hitting B&B node budgets."""

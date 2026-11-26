@@ -958,7 +958,9 @@ def _solve_node(n, kids, cum, character, session_data, global_settings, tq,
                     try:
                         from ui.fastest_craft_service_frontier import frontier_survivors_for_recipe
                         from ui.crafting_tree import _load_game_data as _ld_gd
-                        _memo = global_settings.setdefault('_fc_frontier_memo', {})
+                        _memo = (leaf_memo.setdefault('__fc_service_frontier_memo__', {})
+                                 if leaf_memo is not None
+                                 else global_settings.setdefault('_fc_frontier_memo', {}))
                         _survivors = frontier_survivors_for_recipe(
                             r, _ld_gd(), session_data,
                             include_quality=bool(apply_q or tq != 'Normal'),

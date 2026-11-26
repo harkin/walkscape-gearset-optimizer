@@ -82,6 +82,49 @@ class ExactXpOptimizer(ExactGearsetOptimizer):
         # Admissible: independent per-slot max of A_xp and P_xp reserves.
         return (X0 + s["A_xp"] + R["A_xp"]) * (1.0 + s["P_xp"] + R["P_xp"])
 
+    def _make_eval_fns(self, X0, S0, kappa, WE_level, base_stats):
+        AXES = self.AXES
+        iAx = AXES.index("A_xp"); iPx = AXES.index("P_xp")
+        iW = AXES.index("W"); iSa = AXES.index("S_add")
+        iSp = AXES.index("S_pct"); iB = AXES.index("B")
+        step_floor = self.STEP_FLOOR
+        _ceil = math.ceil
+        step_cache = {}
+        sc_get = step_cache.get
+
+        def eval_sv(sv):
+            w = sv[iW]; sa = sv[iSa]; sp = sv[iSp]; b = sv[iB]
+            key = (w, sa, sp, b)
+            st = sc_get(key)
+            if st is None:
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
+                st = stp / (1.0 + b)
+                step_cache[key] = st
+            return ((X0 + sv[iAx]) * (1.0 + sv[iPx])) / st
+
+        def eval_pair(bv, cv):
+            w = bv[iW] + cv[iW]; sa = bv[iSa] + cv[iSa]
+            sp = bv[iSp] + cv[iSp]; b = bv[iB] + cv[iB]
+            key = (w, sa, sp, b)
+            st = sc_get(key)
+            if st is None:
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
+                st = stp / (1.0 + b)
+                step_cache[key] = st
+            return ((X0 + bv[iAx] + cv[iAx]) * (1.0 + bv[iPx] + cv[iPx])) / st
+
+        return eval_sv, eval_sv, eval_pair
+
     def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
         """Inlined KD-blocked upper-bound-pruned XP FG × FA combine."""
         AXES = self.AXES
