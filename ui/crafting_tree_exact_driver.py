@@ -458,7 +458,8 @@ _DOM_GEAR_SLOTS = ('head', 'cape', 'back', 'chest', 'hands', 'legs', 'neck',
 
 
 def _dominance_swap_gear(gear, skill, location, character, log, session_uuid,
-                         more_axes=_DOM_MORE_IS_BETTER, less_axes=_DOM_LESS_IS_BETTER):
+                         more_axes=_DOM_MORE_IS_BETTER, less_axes=_DOM_LESS_IS_BETTER,
+                         leaf_memo=None):
     """Single-swap dominance guard (bug cccc3581 / 1f19d6da). The exact B&B can
     hit its node budget on a large pool (e.g. a 15-pet candidate set bloats the
     search) and return a NON-proof-optimal incumbent that leaves a strictly
@@ -484,11 +485,24 @@ def _dominance_swap_gear(gear, skill, location, character, log, session_uuid,
     if not isinstance(gear, dict):
         return gear
 
+    _stats_cache = None
+    if leaf_memo is not None:
+        _stats_cache = (leaf_memo.setdefault('__craft_mitm_memo__', {})
+                        .setdefault('__item_stats__', {})
+                        .setdefault((id(character), str(skill).lower(), str(location)), {}))
+
     def _rel_stats(item):
         if item is None or not hasattr(item, 'get_stats_for_skill'):
             return {}
         try:
-            st = item.get_stats_for_skill(skill, location=location, character=character) or {}
+            if _stats_cache is not None:
+                k = id(item)
+                st = _stats_cache.get(k)
+                if st is None:
+                    st = item.get_stats_for_skill(skill, location=location, character=character) or {}
+                    _stats_cache[k] = st
+            else:
+                st = item.get_stats_for_skill(skill, location=location, character=character) or {}
         except Exception:
             return {}
         return {k: float(v) for k, v in st.items()
@@ -510,24 +524,29 @@ def _dominance_swap_gear(gear, skill, location, character, log, session_uuid,
                 strictly = True
         return strictly
 
-    # Owned, unlocked candidates per single-occupancy gear slot.
-    by_slot = {}
-    for it, qty in (getattr(character, 'items', {}) or {}).items():
-        if not qty or not hasattr(it, 'slot'):
-            continue
-        sl = getattr(it, 'slot', None)
-        if sl not in _DOM_GEAR_SLOTS and not (sl == 'ring' or sl == 'rings'):
-            # some data models tag both rings as slot='ring'; map to ring1/ring2
-            if sl not in ('ring', 'rings'):
+    # Owned, unlocked candidates per single-occupancy gear slot (cached per character).
+    _dom_bs = leaf_memo.setdefault('__dom_by_slot__', {}) if leaf_memo is not None else None
+    by_slot = _dom_bs.get(id(character)) if _dom_bs is not None else None
+    if by_slot is None:
+        by_slot = {}
+        for it, qty in (getattr(character, 'items', {}) or {}).items():
+            if not qty or not hasattr(it, 'slot'):
                 continue
-        if hasattr(it, 'is_unlocked'):
-            try:
-                if not it.is_unlocked(character, ignore_gear_requirements=True):
+            sl = getattr(it, 'slot', None)
+            if sl not in _DOM_GEAR_SLOTS and not (sl == 'ring' or sl == 'rings'):
+                # some data models tag both rings as slot='ring'; map to ring1/ring2
+                if sl not in ('ring', 'rings'):
                     continue
-            except Exception:
-                pass
-        for target in ((['ring1', 'ring2']) if sl in ('ring', 'rings') else [sl]):
-            by_slot.setdefault(target, []).append(it)
+            if hasattr(it, 'is_unlocked'):
+                try:
+                    if not it.is_unlocked(character, ignore_gear_requirements=True):
+                        continue
+                except Exception:
+                    pass
+            for target in ((['ring1', 'ring2']) if sl in ('ring', 'rings') else [sl]):
+                by_slot.setdefault(target, []).append(it)
+        if _dom_bs is not None:
+            _dom_bs[id(character)] = by_slot
 
     swapped = []
     equipped_ids = {id(gear.get(s)) for s in _DOM_GEAR_SLOTS if gear.get(s) is not None}
@@ -866,7 +885,8 @@ def _solve_node(n, kids, cum, character, session_data, global_settings, tq,
                                         if leaf_memo is not None else None))
                         if gear:
                             gear = _dominance_swap_gear(
-                                gear, node_skill, loc or act_loc, character, log, session_uuid)
+                                gear, node_skill, loc or act_loc, character, log, session_uuid,
+                                leaf_memo=leaf_memo)
                         # Cache the result (including an empty "no gear is best" or
                         # a None "infeasible" outcome): the expensive [MITM-ONLY]
                         # solve ran regardless, and reusing any deterministic
@@ -941,7 +961,8 @@ def _solve_node(n, kids, cum, character, session_data, global_settings, tq,
                     if g:
                         g = _dominance_swap_gear(
                             g, node_skill, _rl, character, log, session_uuid,
-                            more_axes=_DOM_CRAFT_MORE, less_axes=_DOM_LESS_IS_BETTER)
+                            more_axes=_DOM_CRAFT_MORE, less_axes=_DOM_LESS_IS_BETTER,
+                            leaf_memo=leaf_memo)
                     _result = (g, pcm, ppm)
                     if _rk is not None:
                         leaf_memo.setdefault('__recipe_memo__', {})[_rk] = _result
