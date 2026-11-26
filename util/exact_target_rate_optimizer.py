@@ -46,10 +46,13 @@ _TARGET_FIND_AXES = (
     "find_linens", "fine_material_finding",
 )
 
-# Character stat keys that are engine axes (steps / cap / dr), NOT find-axes —
-# excluded from the discovered candidate set (they're handled as explicit AXES).
+# Character stat keys that are engine axes (steps / cap / dr) or non-drop stats
+# (XP / craft / inventory), NOT find-axes — excluded from the discovered
+# candidate set so prepare() skips redundant get_expected_drop_rate probes.
 _ENGINE_STAT_KEYS = frozenset((
     "work_efficiency", "double_action", "double_rewards", "steps_add", "steps_percent",
+    "bonus_xp_add", "bonus_xp_percent", "quality_outcome", "no_materials_consumed",
+    "inventory_space", "steps_required",
 ))
 
 
@@ -210,7 +213,8 @@ class ExactCurrencyValueOptimizer(ExactCoinsOptimizer):
 
 def exact_currency_optimize(activity, character, currency_target, skill=None,
                             location=None, base_stats=None, pets=None,
-                            consumables=None, input_item=None):
+                            consumables=None, input_item=None,
+                            tool_frontier_cache=None, mitm_cache=None):
     """Return {slot: Item|None} maximizing currency (AGT / Sea Shells) value per
     step, or None to fall back to greedy. `currency_target` is the cat:
     synthetic ('cat:if:adventurers_guild_tokens' | 'cat:sea_shells')."""
@@ -222,7 +226,9 @@ def exact_currency_optimize(activity, character, currency_target, skill=None,
     opt._MITM_VALIDATE = _MITM_VALIDATE
     result = opt.optimize(activity, character, skill=skill, location=location,
                           base_stats=base_stats, pets=pets, consumables=consumables,
-                          input_item=input_item)
+                          input_item=input_item,
+                          tool_frontier_cache=tool_frontier_cache,
+                          mitm_cache=mitm_cache)
     globals()["last_run_budget_exhausted"] = opt.last_run_budget_exhausted
     return result
 
@@ -369,7 +375,7 @@ class ExactFineRateOptimizer(ExactTargetRateOptimizer):
             return ((1.0 + bv[idr] + cv[idr]) * (C0 + bv[iAc] + cv[iAc])
                     * (1.0 + kf * (bv[iF] + cv[iF]))) / st
 
-        return eval_sv, eval_sv, eval_pair
+        return eval_sv, eval_sv, eval_pair, eval_pair
 
     def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
         """Inlined KD-blocked upper-bound-pruned fine-rate FG × FA combine."""
@@ -526,7 +532,8 @@ class ExactFineRateOptimizer(ExactTargetRateOptimizer):
 
 def exact_fine_rate_optimize(activity, character, target_items, skill=None,
                              location=None, base_stats=None, pets=None,
-                             consumables=None, input_item=None, fast=False):
+                             consumables=None, input_item=None, fast=False,
+                             tool_frontier_cache=None, mitm_cache=None):
     """Return {slot: Item|None} maximizing a FINE item's rate/step, or None.
 
     MITM enabled: the _combine_best override models the (1+k_fmf*F) fine factor
@@ -544,7 +551,9 @@ def exact_fine_rate_optimize(activity, character, target_items, skill=None,
     opt.GREEDY_SEED_ONLY = bool(fast)
     result = opt.optimize(activity, character, skill=skill, location=location,
                           base_stats=base_stats, pets=pets, consumables=consumables,
-                          input_item=input_item)
+                          input_item=input_item,
+                          tool_frontier_cache=tool_frontier_cache,
+                          mitm_cache=mitm_cache)
     globals()["last_run_budget_exhausted"] = opt.last_run_budget_exhausted
     return result
 
@@ -584,7 +593,8 @@ class ExactFindingRateOptimizer(ExactCoinsOptimizer):
 
 def exact_finding_rate_optimize(activity, character, target, skill=None,
                                 location=None, base_stats=None, pets=None,
-                                consumables=None, input_item=None):
+                                consumables=None, input_item=None,
+                                tool_frontier_cache=None, mitm_cache=None):
     """Return {slot: Item|None} maximizing a cat:if:<CAT> item-finding rate/step,
     or None. `target` is the 'cat:if:<cat>' synthetic (same 3rd-positional shape
     as the other exact entries); the ItemFindingCategory stat key is derived
@@ -603,7 +613,9 @@ def exact_finding_rate_optimize(activity, character, target, skill=None,
     opt._MITM_VALIDATE = _MITM_VALIDATE
     result = opt.optimize(activity, character, skill=skill, location=location,
                           base_stats=base_stats, pets=pets, consumables=consumables,
-                          input_item=input_item)
+                          input_item=input_item,
+                          tool_frontier_cache=tool_frontier_cache,
+                          mitm_cache=mitm_cache)
     globals()["last_run_budget_exhausted"] = opt.last_run_budget_exhausted
     return result
 
@@ -611,7 +623,7 @@ def exact_finding_rate_optimize(activity, character, target, skill=None,
 def exact_target_rate_optimize(activity, character, target_items, skill=None,
                                location=None, base_stats=None, pets=None,
                                consumables=None, input_item=None, frontier_cache=None,
-                               fast=False):
+                               fast=False, tool_frontier_cache=None, mitm_cache=None):
     """Return {slot: Item|None} maximizing (target-item rate)/step, or None to
     fall back. `target_items` = one item name or a list (combined new-items)."""
     opt = ExactTargetRateOptimizer(target_items)
@@ -623,7 +635,9 @@ def exact_target_rate_optimize(activity, character, target_items, skill=None,
     opt.GREEDY_SEED_ONLY = bool(fast)
     result = opt.optimize(activity, character, skill=skill, location=location,
                           base_stats=base_stats, pets=pets, consumables=consumables,
-                          input_item=input_item, frontier_cache=frontier_cache)
+                          input_item=input_item, frontier_cache=frontier_cache,
+                          tool_frontier_cache=tool_frontier_cache,
+                          mitm_cache=mitm_cache)
     globals()["last_run_budget_exhausted"] = opt.last_run_budget_exhausted
     return result
 

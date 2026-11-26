@@ -142,6 +142,12 @@ class ExactCoinsOptimizer(ExactGearsetOptimizer):
         return (1.0 + s["dr"] + R.get("dr", 0.)) * (
             self._C0 + s.get("A_coins", 0.0) + R.get("A_coins", 0.0))
 
+    def _mitm_cache_extra_key(self):
+        return (
+            bool(getattr(self, "_one_time", False)),
+            tuple(sorted((a, round(float(v), 10)) for a, v in self._k.items())),
+        )
+
     def _make_eval_fns(self, X0, S0, kappa, WE_level, base_stats):
         AXES = self.AXES
         iW = AXES.index("W"); iSa = AXES.index("S_add"); iSp = AXES.index("S_pct")
@@ -183,7 +189,7 @@ class ExactCoinsOptimizer(ExactGearsetOptimizer):
                 step_cache[key] = st
             return ((1.0 + bv[idr] + cv[idr]) * (C0 + bv[iAc] + cv[iAc])) / st
 
-        return eval_sv, eval_sv, eval_pair
+        return eval_sv, eval_sv, eval_pair, eval_pair
 
     def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
         """Inlined KD-blocked upper-bound-pruned coins FG × FA combine."""
@@ -331,7 +337,8 @@ class ExactCoinsOptimizer(ExactGearsetOptimizer):
 
 
 def exact_coins_optimize(activity, character, skill=None, location=None, base_stats=None,
-                         pets=None, consumables=None, input_item=None, include_chests=True):
+                         pets=None, consumables=None, input_item=None, include_chests=True,
+                         tool_frontier_cache=None, mitm_cache=None):
     """Return {slot: Item|None} maximizing coins/step, or None to fall back."""
     opt = ExactCoinsOptimizer(include_chests=include_chests)
     opt.NODE_BUDGET = _EXACT_NODE_BUDGET
@@ -341,6 +348,8 @@ def exact_coins_optimize(activity, character, skill=None, location=None, base_st
     opt._MITM_VALIDATE = _MITM_VALIDATE
     result = opt.optimize(activity, character, skill=skill, location=location,
                           base_stats=base_stats, pets=pets, consumables=consumables,
-                          input_item=input_item)
+                          input_item=input_item,
+                          tool_frontier_cache=tool_frontier_cache,
+                          mitm_cache=mitm_cache)
     globals()["last_run_budget_exhausted"] = opt.last_run_budget_exhausted
     return result

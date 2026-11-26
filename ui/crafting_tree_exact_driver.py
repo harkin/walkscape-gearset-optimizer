@@ -859,7 +859,11 @@ def _solve_node(n, kids, cum, character, session_data, global_settings, tq,
                             act, character, tgt, skill=node_skill,
                             location=loc or act_loc, pets=_pets, consumables=_cons,
                             input_item=_ct_input_obj, base_stats=_pin_overlay or None,
-                            fast=_fast)
+                            fast=_fast,
+                            tool_frontier_cache=(leaf_memo.setdefault('__tool_frontier_memo__', {})
+                                                 if leaf_memo is not None else None),
+                            mitm_cache=(leaf_memo.setdefault('__craft_mitm_memo__', {})
+                                        if leaf_memo is not None else None))
                         if gear:
                             gear = _dominance_swap_gear(
                                 gear, node_skill, loc or act_loc, character, log, session_uuid)

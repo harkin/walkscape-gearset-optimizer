@@ -329,7 +329,39 @@ class ExactCraftStepsOptimizer(ExactGearsetOptimizer):
                 st += (1.0 - nmc_c) * mat0
             return num / st
 
-        return eval_sv, eval_ub_sv, eval_pair
+        def eval_ub_pair(bv, cv):
+            dr = bv[idr] + cv[idr]
+            dr_c = 1.0 if dr > 1.0 else (0.0 if dr < 0.0 else dr)
+            if has_qo:
+                qo = bv[iqo] + cv[iqo]
+                p = qp_get(qo)
+                if p is None:
+                    p = _qp(qo)
+                if qo + lb_qo > 400.0 and qp_peak400 > p:
+                    p = qp_peak400
+                num = (1.0 + dr_c) * p
+            else:
+                num = 1.0 + dr_c
+            w = bv[iW] + cv[iW]; sa = bv[iSa] + cv[iSa]
+            sp = bv[iSp] + cv[iSp]; b = bv[iB] + cv[iB]
+            key = (w, sa, sp, b)
+            st = sc_get(key)
+            if st is None:
+                eff = WE_level + w
+                if eff > kappa:
+                    eff = kappa
+                stp = _ceil((S0 / (1.0 + eff)) * (1.0 + sp) + sa)
+                if stp < step_floor:
+                    stp = step_floor
+                st = (stp / (1.0 + b)) * oq_inv
+                step_cache[key] = st
+            if has_nmc:
+                nmc = bv[inmc] + cv[inmc]
+                nmc_c = 0.99 if nmc > 0.99 else (0.0 if nmc < 0.0 else nmc)
+                st += (1.0 - nmc_c) * mat0
+            return num / st
+
+        return eval_sv, eval_ub_sv, eval_pair, eval_ub_pair
 
     def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
         """Inlined KD-blocked upper-bound-pruned MITM combine for craft steps.

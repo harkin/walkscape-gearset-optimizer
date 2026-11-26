@@ -123,7 +123,7 @@ class ExactXpOptimizer(ExactGearsetOptimizer):
                 step_cache[key] = st
             return ((X0 + bv[iAx] + cv[iAx]) * (1.0 + bv[iPx] + cv[iPx])) / st
 
-        return eval_sv, eval_sv, eval_pair
+        return eval_sv, eval_sv, eval_pair, eval_pair
 
     def _combine_best(self, FG, FA, reqs, X0, S0, kappa, WE_level, base_stats):
         """Inlined KD-blocked upper-bound-pruned XP FG × FA combine."""
@@ -270,7 +270,8 @@ class ExactXpOptimizer(ExactGearsetOptimizer):
 
 
 def exact_xp_optimize(activity, character, skill=None, location=None, base_stats=None,
-                      pets=None, consumables=None, input_item=None):
+                      pets=None, consumables=None, input_item=None,
+                      tool_frontier_cache=None, mitm_cache=None):
     """Return {slot: Item|None} for controlled slots, or None to fall back."""
     opt = ExactXpOptimizer()
     opt.NODE_BUDGET = _EXACT_NODE_BUDGET
@@ -287,7 +288,9 @@ def exact_xp_optimize(activity, character, skill=None, location=None, base_stats
     opt._MITM_VALIDATE = _MITM_VALIDATE
     result = opt.optimize(activity, character, skill=skill, location=location,
                           base_stats=base_stats, pets=pets, consumables=consumables,
-                          input_item=input_item)
+                          input_item=input_item,
+                          tool_frontier_cache=tool_frontier_cache,
+                          mitm_cache=mitm_cache)
     globals()["last_run_budget_exhausted"] = opt.last_run_budget_exhausted
     globals()["last_run_diag"] = getattr(opt, "last_run_diag", None)
     return result

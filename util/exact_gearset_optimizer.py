@@ -510,7 +510,7 @@ class ExactGearsetOptimizer:
         greedy_seed = self.GREEDY_SEED_ONLY
         dump_active = self._dump_active
         use_tuple_eval = (lambda_val is None)
-        eval_sv, eval_ub_sv, _ = self._make_eval_fns(X0, S0, kappa, WE_level, base_stats)
+        eval_sv, eval_ub_sv, _, eval_ub_pair = self._make_eval_fns(X0, S0, kappa, WE_level, base_stats)
 
         _pair_rA = _pair_rB = -1
         _ring_canon = {}
@@ -541,7 +541,7 @@ class ExactGearsetOptimizer:
             br = best["r"]
             if br > _NEG_INF:
                 if use_tuple_eval:
-                    ub = eval_ub_sv(tuple(map(_add, sv, Rs_tup[idx])))
+                    ub = eval_ub_pair(sv, Rs_tup[idx])
                 else:
                     s_d = dict(zip(AXES, sv))
                     Ri = Rs_dict[idx]
@@ -691,11 +691,14 @@ class ExactGearsetOptimizer:
         (dt, ..., comp, tb, dt_sum), where higher is better on every coordinate
         of `dt`. Combines:
           1. O(1) exact-`dt` dict deduplication (keeping best (tb, -len(comp))).
-          2. Sort-Filter-Skyline descending by `dt_sum`.
-          3. Global `gmax` O(1) instant-accept + 64-element bounding-box blocks
-             with unrolled dominance checks for dlen 4..8.
-          4. O(1) tail-only reverse dominance check (eliminating O(|kept|^2)
-             list copying)."""
+          2. Constant-column stripping (exact dimensionality reduction; O(n) for
+             1D, exact O(n log n) skyline sweep for 2D).
+          3. Orthant-bitmask spatial indexing when n > 96 and pdim >= 3:
+             median-splits up to 4 varying axes so a candidate with orthant code
+             `sc` ONLY queries kept orthants `kc` with `(kc & sc) == sc`, giving
+             tight spatial bounding boxes and skipping 70-95% of kept points.
+          4. Unrolled dominance checks for pdim 3..8 + O(1) tail-only reverse
+             dominance removal."""
         n = len(items)
         if n <= 1:
             return items
@@ -714,29 +717,435 @@ class ExactGearsetOptimizer:
             return list(by_dt.values())
 
         uniq = list(by_dt.values())
-        uniq.sort(key=lambda s: s[5], reverse=True)
         dlen = len(uniq[0][0])
 
-        first = uniq[0]
-        fdt = first[0]
-        kept = [first]
+        # Step 2: Strip constant columns when worthwhile -> reduces effective dim
+        if len(uniq) > 24 and dlen > 2:
+            fdt0 = uniq[0][0]
+            lo = list(fdt0)
+            hi = list(fdt0)
+            for s in uniq:
+                dt = s[0]
+                for j in range(dlen):
+                    v = dt[j]
+                    if v < lo[j]:
+                        lo[j] = v
+                    elif v > hi[j]:
+                        hi[j] = v
+            var_cols = tuple(j for j in range(dlen) if hi[j] > lo[j])
+        else:
+            var_cols = None
+
+        if var_cols is not None and len(var_cols) < dlen:
+            pdim = len(var_cols)
+            if pdim == 0:
+                return [uniq[0]]
+            if pdim == 1:
+                c0 = var_cols[0]
+                return [max(uniq, key=lambda s: s[0][c0])]
+            if pdim == 2:
+                c0, c1 = var_cols
+                uniq.sort(key=lambda s: (-s[0][c0], -s[0][c1]))
+                out = [uniq[0]]
+                best_y = uniq[0][0][c1]
+                for s in uniq[1:]:
+                    y = s[0][c1]
+                    if y > best_y:
+                        out.append(s)
+                        best_y = y
+                return out
+            # Project dt onto var_cols (constant columns shift dt_sum by a
+            # constant, so s[5] preserves exact sum(pdt) ordering!).
+            if pdim == 3:
+                c0, c1, c2 = var_cols
+                pdts = [(s[0][c0], s[0][c1], s[0][c2]) for s in uniq]
+            elif pdim == 4:
+                c0, c1, c2, c3 = var_cols
+                pdts = [(s[0][c0], s[0][c1], s[0][c2], s[0][c3]) for s in uniq]
+            elif pdim == 5:
+                c0, c1, c2, c3, c4 = var_cols
+                pdts = [(s[0][c0], s[0][c1], s[0][c2], s[0][c3], s[0][c4]) for s in uniq]
+            elif pdim == 6:
+                c0, c1, c2, c3, c4, c5 = var_cols
+                pdts = [(s[0][c0], s[0][c1], s[0][c2], s[0][c3], s[0][c4], s[0][c5]) for s in uniq]
+            elif pdim == 7:
+                c0, c1, c2, c3, c4, c5, c6 = var_cols
+                pdts = [(s[0][c0], s[0][c1], s[0][c2], s[0][c3], s[0][c4], s[0][c5], s[0][c6]) for s in uniq]
+            else:
+                pdts = [tuple(s[0][c] for c in var_cols) for s in uniq]
+            pairs = list(zip(uniq, pdts))
+            pairs.sort(key=lambda x: x[0][5], reverse=True)
+        else:
+            pdim = dlen
+            if pdim == 1:
+                return [max(uniq, key=lambda s: s[0][0])]
+            if pdim == 2:
+                uniq.sort(key=lambda s: (-s[0][0], -s[0][1]))
+                out = [uniq[0]]
+                best_y = uniq[0][0][1]
+                for s in uniq[1:]:
+                    y = s[0][1]
+                    if y > best_y:
+                        out.append(s)
+                        best_y = y
+                return out
+            uniq.sort(key=lambda s: s[5], reverse=True)
+            pairs = [(s, s[0]) for s in uniq]
+
+        n_uniq = len(pairs)
+        use_orthants = (n_uniq > 96 and pdim >= 3)
+
+        if use_orthants:
+            # Choose up to 4 split columns by highest spread on a quick sample
+            step = max(1, n_uniq // 128)
+            sample = [pairs[i][1] for i in range(0, n_uniq, step)]
+            ns = len(sample)
+            mid_i = ns // 2
+            sp_cols = []
+            sp_meds = []
+            # Pick columns with non-trivial median split (both sides non-empty)
+            cand_splits = []
+            for j in range(pdim):
+                col = sorted(p[j] for p in sample)
+                med = col[mid_i]
+                if col[0] < med <= col[-1]:
+                    # Balance score: count strictly below med
+                    lo_cnt = 0
+                    for v in col:
+                        if v < med:
+                            lo_cnt += 1
+                        else:
+                            break
+                    bal = min(lo_cnt, ns - lo_cnt)
+                    cand_splits.append((bal, j, med))
+            cand_splits.sort(key=lambda x: x[0], reverse=True)
+            for _bal, j, med in cand_splits[:min(4, len(cand_splits))]:
+                sp_cols.append(j)
+                sp_meds.append(med)
+            nbits = len(sp_cols)
+            if nbits == 0:
+                use_orthants = False
+
+        if use_orthants:
+            n_oct = 1 << nbits
+            supersets = [tuple(k for k in range(n_oct) if (k & c) == c) for c in range(n_oct)]
+            oct_gmax = [None] * n_oct
+            oct_blocks = [[] for _ in range(n_oct)]
+
+            if nbits == 4:
+                a0, a1, a2, a3 = sp_cols; m0, m1, m2, m3 = sp_meds
+                def _code(pdt):
+                    return ((1 if pdt[a0] >= m0 else 0)
+                            | (2 if pdt[a1] >= m1 else 0)
+                            | (4 if pdt[a2] >= m2 else 0)
+                            | (8 if pdt[a3] >= m3 else 0))
+            elif nbits == 3:
+                a0, a1, a2 = sp_cols; m0, m1, m2 = sp_meds
+                def _code(pdt):
+                    return ((1 if pdt[a0] >= m0 else 0)
+                            | (2 if pdt[a1] >= m1 else 0)
+                            | (4 if pdt[a2] >= m2 else 0))
+            elif nbits == 2:
+                a0, a1 = sp_cols; m0, m1 = sp_meds
+                def _code(pdt):
+                    return (1 if pdt[a0] >= m0 else 0) | (2 if pdt[a1] >= m1 else 0)
+            else:
+                a0 = sp_cols[0]; m0 = sp_meds[0]
+                def _code(pdt):
+                    return 1 if pdt[a0] >= m0 else 0
+
+            kept = []  # list of (s, pdt, scode)
+            rng_p = range(pdim)
+
+            def _add_oct(pdt, scode):
+                blks = oct_blocks[scode]
+                if not blks or len(blks[-1][1]) >= 32:
+                    blks.append([list(pdt), [pdt]])
+                else:
+                    blk = blks[-1]
+                    bm = blk[0]
+                    for j in rng_p:
+                        if pdt[j] > bm[j]:
+                            bm[j] = pdt[j]
+                    blk[1].append(pdt)
+                gm = oct_gmax[scode]
+                if gm is None:
+                    oct_gmax[scode] = list(pdt)
+                else:
+                    for j in rng_p:
+                        if pdt[j] > gm[j]:
+                            gm[j] = pdt[j]
+
+            def _tail_remove_oct(s_pdt, s_sum):
+                thr = s_sum + 1e-9
+                p = len(kept) - 1
+                while p >= 0 and kept[p][0][5] <= thr:
+                    k_pdt = kept[p][1]
+                    dom = True
+                    for j in rng_p:
+                        if s_pdt[j] < k_pdt[j]:
+                            dom = False
+                            break
+                    if dom:
+                        k_code = kept[p][2]
+                        del kept[p]
+                        blks = oct_blocks[k_code]
+                        for bi in range(len(blks) - 1, -1, -1):
+                            bdts = blks[bi][1]
+                            try:
+                                bdts.remove(k_pdt)
+                                if not bdts:
+                                    del blks[bi]
+                                else:
+                                    bm = list(bdts[0])
+                                    for xdt in bdts[1:]:
+                                        for j in rng_p:
+                                            if xdt[j] > bm[j]:
+                                                bm[j] = xdt[j]
+                                    blks[bi][0] = bm
+                                break
+                            except ValueError:
+                                continue
+                        if not blks:
+                            oct_gmax[k_code] = None
+                    p -= 1
+
+            # Dispatch pdim ONCE for orthant dominance
+            if pdim == 6:
+                for s, pdt in pairs:
+                    sc = _code(pdt)
+                    s0, s1, s2, s3, s4, s5 = pdt
+                    dominated = False
+                    for kc in supersets[sc]:
+                        gm = oct_gmax[kc]
+                        if (gm is None or s0 > gm[0] or s1 > gm[1] or s2 > gm[2]
+                                or s3 > gm[3] or s4 > gm[4] or s5 > gm[5]):
+                            continue
+                        for bm, bdts in oct_blocks[kc]:
+                            if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
+                                    or bm[3] < s3 or bm[4] < s4 or bm[5] < s5):
+                                continue
+                            for kdt in bdts:
+                                if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
+                                        and kdt[3] >= s3 and kdt[4] >= s4 and kdt[5] >= s5):
+                                    dominated = True
+                                    break
+                            if dominated:
+                                break
+                        if dominated:
+                            break
+                    if dominated:
+                        continue
+                    if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                        _tail_remove_oct(pdt, s[5])
+                    kept.append((s, pdt, sc))
+                    _add_oct(pdt, sc)
+            elif pdim == 5:
+                for s, pdt in pairs:
+                    sc = _code(pdt)
+                    s0, s1, s2, s3, s4 = pdt
+                    dominated = False
+                    for kc in supersets[sc]:
+                        gm = oct_gmax[kc]
+                        if (gm is None or s0 > gm[0] or s1 > gm[1] or s2 > gm[2]
+                                or s3 > gm[3] or s4 > gm[4]):
+                            continue
+                        for bm, bdts in oct_blocks[kc]:
+                            if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
+                                    or bm[3] < s3 or bm[4] < s4):
+                                continue
+                            for kdt in bdts:
+                                if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
+                                        and kdt[3] >= s3 and kdt[4] >= s4):
+                                    dominated = True
+                                    break
+                            if dominated:
+                                break
+                        if dominated:
+                            break
+                    if dominated:
+                        continue
+                    if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                        _tail_remove_oct(pdt, s[5])
+                    kept.append((s, pdt, sc))
+                    _add_oct(pdt, sc)
+            elif pdim == 4:
+                for s, pdt in pairs:
+                    sc = _code(pdt)
+                    s0, s1, s2, s3 = pdt
+                    dominated = False
+                    for kc in supersets[sc]:
+                        gm = oct_gmax[kc]
+                        if gm is None or s0 > gm[0] or s1 > gm[1] or s2 > gm[2] or s3 > gm[3]:
+                            continue
+                        for bm, bdts in oct_blocks[kc]:
+                            if bm[0] < s0 or bm[1] < s1 or bm[2] < s2 or bm[3] < s3:
+                                continue
+                            for kdt in bdts:
+                                if kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2 and kdt[3] >= s3:
+                                    dominated = True
+                                    break
+                            if dominated:
+                                break
+                        if dominated:
+                            break
+                    if dominated:
+                        continue
+                    if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                        _tail_remove_oct(pdt, s[5])
+                    kept.append((s, pdt, sc))
+                    _add_oct(pdt, sc)
+            elif pdim == 3:
+                for s, pdt in pairs:
+                    sc = _code(pdt)
+                    s0, s1, s2 = pdt
+                    dominated = False
+                    for kc in supersets[sc]:
+                        gm = oct_gmax[kc]
+                        if gm is None or s0 > gm[0] or s1 > gm[1] or s2 > gm[2]:
+                            continue
+                        for bm, bdts in oct_blocks[kc]:
+                            if bm[0] < s0 or bm[1] < s1 or bm[2] < s2:
+                                continue
+                            for kdt in bdts:
+                                if kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2:
+                                    dominated = True
+                                    break
+                            if dominated:
+                                break
+                        if dominated:
+                            break
+                    if dominated:
+                        continue
+                    if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                        _tail_remove_oct(pdt, s[5])
+                    kept.append((s, pdt, sc))
+                    _add_oct(pdt, sc)
+            elif pdim == 7:
+                for s, pdt in pairs:
+                    sc = _code(pdt)
+                    s0, s1, s2, s3, s4, s5, s6 = pdt
+                    dominated = False
+                    for kc in supersets[sc]:
+                        gm = oct_gmax[kc]
+                        if (gm is None or s0 > gm[0] or s1 > gm[1] or s2 > gm[2]
+                                or s3 > gm[3] or s4 > gm[4] or s5 > gm[5] or s6 > gm[6]):
+                            continue
+                        for bm, bdts in oct_blocks[kc]:
+                            if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
+                                    or bm[3] < s3 or bm[4] < s4 or bm[5] < s5 or bm[6] < s6):
+                                continue
+                            for kdt in bdts:
+                                if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
+                                        and kdt[3] >= s3 and kdt[4] >= s4 and kdt[5] >= s5
+                                        and kdt[6] >= s6):
+                                    dominated = True
+                                    break
+                            if dominated:
+                                break
+                        if dominated:
+                            break
+                    if dominated:
+                        continue
+                    if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                        _tail_remove_oct(pdt, s[5])
+                    kept.append((s, pdt, sc))
+                    _add_oct(pdt, sc)
+            elif pdim == 8:
+                for s, pdt in pairs:
+                    sc = _code(pdt)
+                    s0, s1, s2, s3, s4, s5, s6, s7 = pdt
+                    dominated = False
+                    for kc in supersets[sc]:
+                        gm = oct_gmax[kc]
+                        if (gm is None or s0 > gm[0] or s1 > gm[1] or s2 > gm[2]
+                                or s3 > gm[3] or s4 > gm[4] or s5 > gm[5]
+                                or s6 > gm[6] or s7 > gm[7]):
+                            continue
+                        for bm, bdts in oct_blocks[kc]:
+                            if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
+                                    or bm[3] < s3 or bm[4] < s4 or bm[5] < s5
+                                    or bm[6] < s6 or bm[7] < s7):
+                                continue
+                            for kdt in bdts:
+                                if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
+                                        and kdt[3] >= s3 and kdt[4] >= s4 and kdt[5] >= s5
+                                        and kdt[6] >= s6 and kdt[7] >= s7):
+                                    dominated = True
+                                    break
+                            if dominated:
+                                break
+                        if dominated:
+                            break
+                    if dominated:
+                        continue
+                    if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                        _tail_remove_oct(pdt, s[5])
+                    kept.append((s, pdt, sc))
+                    _add_oct(pdt, sc)
+            else:
+                for s, pdt in pairs:
+                    sc = _code(pdt)
+                    dominated = False
+                    for kc in supersets[sc]:
+                        gm = oct_gmax[kc]
+                        if gm is None:
+                            continue
+                        skip_g = False
+                        for j in rng_p:
+                            if pdt[j] > gm[j]:
+                                skip_g = True
+                                break
+                        if skip_g:
+                            continue
+                        for bm, bdts in oct_blocks[kc]:
+                            skip = False
+                            for j in rng_p:
+                                if bm[j] < pdt[j]:
+                                    skip = True
+                                    break
+                            if skip:
+                                continue
+                            for kdt in bdts:
+                                dom = True
+                                for j in rng_p:
+                                    if kdt[j] < pdt[j]:
+                                        dom = False
+                                        break
+                                if dom:
+                                    dominated = True
+                                    break
+                            if dominated:
+                                break
+                        if dominated:
+                            break
+                    if dominated:
+                        continue
+                    if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                        _tail_remove_oct(pdt, s[5])
+                    kept.append((s, pdt, sc))
+                    _add_oct(pdt, sc)
+            return [x[0] for x in kept]
+
+        # Small-n fast path (<= 96 unique points): single-block / flat SFS
+        first_s, fdt = pairs[0]
+        kept = [(first_s, fdt)]
         gmax = list(fdt)
-        # Each block is [bmax_list, list_of_kdt]
         blocks = [[list(fdt), [fdt]]]
+        rng_p = range(pdim)
 
         def _tail_remove(s_dt, s_sum):
             thr = s_sum + 1e-9
             p = len(kept) - 1
-            while p >= 0 and kept[p][5] <= thr:
-                kdt = kept[p][0]
+            while p >= 0 and kept[p][0][5] <= thr:
+                kdt = kept[p][1]
                 dom = True
-                for j in range(dlen):
+                for j in rng_p:
                     if s_dt[j] < kdt[j]:
                         dom = False
                         break
                 if dom:
                     del kept[p]
-                    # Remove kdt from its block (searching from the end)
                     for bi in range(len(blocks) - 1, -1, -1):
                         bdts = blocks[bi][1]
                         try:
@@ -746,7 +1155,7 @@ class ExactGearsetOptimizer:
                             else:
                                 bm = list(bdts[0])
                                 for xdt in bdts[1:]:
-                                    for j in range(dlen):
+                                    for j in rng_p:
                                         if xdt[j] > bm[j]:
                                             bm[j] = xdt[j]
                                 blocks[bi][0] = bm
@@ -761,17 +1170,79 @@ class ExactGearsetOptimizer:
             else:
                 blk = blocks[-1]
                 bm = blk[0]
-                for j in range(dlen):
+                for j in rng_p:
                     if s_dt[j] > bm[j]:
                         bm[j] = s_dt[j]
                 blk[1].append(s_dt)
-            for j in range(dlen):
+            for j in rng_p:
                 if s_dt[j] > gmax[j]:
                     gmax[j] = s_dt[j]
 
-        if dlen == 6:
-            for s in uniq[1:]:
-                sdt = s[0]
+        if pdim == 3:
+            for s, sdt in pairs[1:]:
+                s0, s1, s2 = sdt
+                dominated = False
+                if s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]:
+                    for bm, bdts in blocks:
+                        if bm[0] < s0 or bm[1] < s1 or bm[2] < s2:
+                            continue
+                        for kdt in bdts:
+                            if kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2:
+                                dominated = True
+                                break
+                        if dominated:
+                            break
+                if dominated:
+                    continue
+                if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                    _tail_remove(sdt, s[5])
+                kept.append((s, sdt))
+                _add_to_blocks(sdt)
+        elif pdim == 4:
+            for s, sdt in pairs[1:]:
+                s0, s1, s2, s3 = sdt
+                dominated = False
+                if s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2] and s3 <= gmax[3]:
+                    for bm, bdts in blocks:
+                        if bm[0] < s0 or bm[1] < s1 or bm[2] < s2 or bm[3] < s3:
+                            continue
+                        for kdt in bdts:
+                            if kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2 and kdt[3] >= s3:
+                                dominated = True
+                                break
+                        if dominated:
+                            break
+                if dominated:
+                    continue
+                if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                    _tail_remove(sdt, s[5])
+                kept.append((s, sdt))
+                _add_to_blocks(sdt)
+        elif pdim == 5:
+            for s, sdt in pairs[1:]:
+                s0, s1, s2, s3, s4 = sdt
+                dominated = False
+                if (s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]
+                        and s3 <= gmax[3] and s4 <= gmax[4]):
+                    for bm, bdts in blocks:
+                        if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
+                                or bm[3] < s3 or bm[4] < s4):
+                            continue
+                        for kdt in bdts:
+                            if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
+                                    and kdt[3] >= s3 and kdt[4] >= s4):
+                                dominated = True
+                                break
+                        if dominated:
+                            break
+                if dominated:
+                    continue
+                if kept and kept[-1][0][5] <= s[5] + 1e-9:
+                    _tail_remove(sdt, s[5])
+                kept.append((s, sdt))
+                _add_to_blocks(sdt)
+        elif pdim == 6:
+            for s, sdt in pairs[1:]:
                 s0, s1, s2, s3, s4, s5 = sdt
                 dominated = False
                 if (s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]
@@ -789,13 +1260,12 @@ class ExactGearsetOptimizer:
                             break
                 if dominated:
                     continue
-                if kept and kept[-1][5] <= s[5] + 1e-9:
+                if kept and kept[-1][0][5] <= s[5] + 1e-9:
                     _tail_remove(sdt, s[5])
-                kept.append(s)
+                kept.append((s, sdt))
                 _add_to_blocks(sdt)
-        elif dlen == 7:
-            for s in uniq[1:]:
-                sdt = s[0]
+        elif pdim == 7:
+            for s, sdt in pairs[1:]:
                 s0, s1, s2, s3, s4, s5, s6 = sdt
                 dominated = False
                 if (s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]
@@ -816,13 +1286,12 @@ class ExactGearsetOptimizer:
                             break
                 if dominated:
                     continue
-                if kept and kept[-1][5] <= s[5] + 1e-9:
+                if kept and kept[-1][0][5] <= s[5] + 1e-9:
                     _tail_remove(sdt, s[5])
-                kept.append(s)
+                kept.append((s, sdt))
                 _add_to_blocks(sdt)
-        elif dlen == 8:
-            for s in uniq[1:]:
-                sdt = s[0]
+        elif pdim == 8:
+            for s, sdt in pairs[1:]:
                 s0, s1, s2, s3, s4, s5, s6, s7 = sdt
                 dominated = False
                 if (s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]
@@ -843,69 +1312,22 @@ class ExactGearsetOptimizer:
                             break
                 if dominated:
                     continue
-                if kept and kept[-1][5] <= s[5] + 1e-9:
+                if kept and kept[-1][0][5] <= s[5] + 1e-9:
                     _tail_remove(sdt, s[5])
-                kept.append(s)
-                _add_to_blocks(sdt)
-        elif dlen == 5:
-            for s in uniq[1:]:
-                sdt = s[0]
-                s0, s1, s2, s3, s4 = sdt
-                dominated = False
-                if (s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]
-                        and s3 <= gmax[3] and s4 <= gmax[4]):
-                    for bm, bdts in blocks:
-                        if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
-                                or bm[3] < s3 or bm[4] < s4):
-                            continue
-                        for kdt in bdts:
-                            if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
-                                    and kdt[3] >= s3 and kdt[4] >= s4):
-                                dominated = True
-                                break
-                        if dominated:
-                            break
-                if dominated:
-                    continue
-                if kept and kept[-1][5] <= s[5] + 1e-9:
-                    _tail_remove(sdt, s[5])
-                kept.append(s)
-                _add_to_blocks(sdt)
-        elif dlen == 4:
-            for s in uniq[1:]:
-                sdt = s[0]
-                s0, s1, s2, s3 = sdt
-                dominated = False
-                if s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2] and s3 <= gmax[3]:
-                    for bm, bdts in blocks:
-                        if bm[0] < s0 or bm[1] < s1 or bm[2] < s2 or bm[3] < s3:
-                            continue
-                        for kdt in bdts:
-                            if kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2 and kdt[3] >= s3:
-                                dominated = True
-                                break
-                        if dominated:
-                            break
-                if dominated:
-                    continue
-                if kept and kept[-1][5] <= s[5] + 1e-9:
-                    _tail_remove(sdt, s[5])
-                kept.append(s)
+                kept.append((s, sdt))
                 _add_to_blocks(sdt)
         else:
-            rng_d = range(dlen)
-            for s in uniq[1:]:
-                sdt = s[0]
+            for s, sdt in pairs[1:]:
                 dominated = False
                 can_dom = True
-                for j in rng_d:
+                for j in rng_p:
                     if sdt[j] > gmax[j]:
                         can_dom = False
                         break
                 if can_dom:
                     for bm, bdts in blocks:
                         skip = False
-                        for j in rng_d:
+                        for j in rng_p:
                             if bm[j] < sdt[j]:
                                 skip = True
                                 break
@@ -913,7 +1335,7 @@ class ExactGearsetOptimizer:
                             continue
                         for kdt in bdts:
                             dom = True
-                            for j in rng_d:
+                            for j in rng_p:
                                 if kdt[j] < sdt[j]:
                                     dom = False
                                     break
@@ -924,17 +1346,18 @@ class ExactGearsetOptimizer:
                             break
                 if dominated:
                     continue
-                if kept and kept[-1][5] <= s[5] + 1e-9:
+                if kept and kept[-1][0][5] <= s[5] + 1e-9:
                     _tail_remove(sdt, s[5])
-                kept.append(s)
+                kept.append((s, sdt))
                 _add_to_blocks(sdt)
-        return kept
+        return [x[0] for x in kept]
 
     @staticmethod
     def _build_kd_blocks(items, max_idxs, min_idxs, has_reqs, n_reqs, leaf_size=32, with_ub=False):
         """Partition combine-side frontier items into tight spatial KD-blocks of
         size <= `leaf_size` with per-block axis bounding boxes and keyword maxima.
-        Each item is (v_tup, kw_tup, nfill, tb, comp, ub)."""
+        Items inside each leaf are sorted descending by `ub` for intra-leaf
+        early-break. Each item is (v_tup, kw_tup, nfill, tb, comp, ub)."""
         if not items:
             return []
         nax = len(items[0][0])
@@ -973,6 +1396,7 @@ class ExactGearsetOptimizer:
 
         blocks = []
         for sub in leaves:
+            sub.sort(key=lambda x: x[5], reverse=True)
             box = [0.0] * nax
             for ax in max_idxs:
                 mx = sub[0][0][ax]
@@ -992,12 +1416,82 @@ class ExactGearsetOptimizer:
                 bkw = tuple(max(x[1][r] for x in sub) for r in range(n_reqs))
             else:
                 bkw = ()
-            max_ub = max(x[5] for x in sub)
+            max_ub = sub[0][5]
             blocks.append((max_ub, tuple(box), bkw, sub))
         blocks.sort(key=lambda b: b[0], reverse=True)
         if with_ub:
             return blocks
         return [(b[1], b[2], b[3]) for b in blocks]
+
+    @staticmethod
+    def _build_kd_tree(items, max_idxs, min_idxs, has_reqs, n_reqs, leaf_size=12):
+        """Build a recursive binary KD-tree over combine-side frontier items.
+        Node tuple: (max_ub, box_tup, kw_tup, left, right, leaf_items, cnt).
+        Internal nodes order children with higher max_ub first; leaves sort
+        items descending by ub."""
+        if not items:
+            return None
+        nax = len(items[0][0])
+        all_idxs = tuple(max_idxs) + tuple(min_idxs)
+        rng_r = range(n_reqs)
+
+        def _make_leaf(sub):
+            sub.sort(key=lambda x: x[5], reverse=True)
+            box = [0.0] * nax
+            for ax in max_idxs:
+                mx = sub[0][0][ax]
+                for x in sub:
+                    v = x[0][ax]
+                    if v > mx:
+                        mx = v
+                box[ax] = mx
+            for ax in min_idxs:
+                mn = sub[0][0][ax]
+                for x in sub:
+                    v = x[0][ax]
+                    if v < mn:
+                        mn = v
+                box[ax] = mn
+            bkw = tuple(max(x[1][r] for x in sub) for r in rng_r) if has_reqs else ()
+            return (sub[0][5], tuple(box), bkw, None, None, sub, len(sub))
+
+        def _build(sub):
+            if len(sub) <= leaf_size:
+                return _make_leaf(sub)
+            best_ax = -1
+            best_spread = 0.0
+            for ax in all_idxs:
+                lo = hi = sub[0][0][ax]
+                for x in sub:
+                    v = x[0][ax]
+                    if v < lo:
+                        lo = v
+                    elif v > hi:
+                        hi = v
+                sp = hi - lo
+                if sp > 1e-12:
+                    norm = sp / (abs(hi) + abs(lo) + 1e-9)
+                    if norm > best_spread:
+                        best_spread = norm
+                        best_ax = ax
+            if best_ax < 0:
+                return _make_leaf(sub)
+            sub.sort(key=lambda x: x[0][best_ax])
+            mid = len(sub) // 2
+            n1 = _build(sub[:mid])
+            n2 = _build(sub[mid:])
+            if n2[0] > n1[0]:
+                n1, n2 = n2, n1
+            b1, b2 = n1[1], n2[1]
+            box = [0.0] * nax
+            for ax in max_idxs:
+                box[ax] = b1[ax] if b1[ax] >= b2[ax] else b2[ax]
+            for ax in min_idxs:
+                box[ax] = b1[ax] if b1[ax] <= b2[ax] else b2[ax]
+            bkw = tuple(n1[2][r] if n1[2][r] >= n2[2][r] else n2[2][r] for r in rng_r) if has_reqs else ()
+            return (n1[0], tuple(box), bkw, n1, n2, None, n1[6] + n2[6])
+
+        return _build(list(items))
 
     def _group_collapse(self, slot_defs, metas=(), reqs=None, headroom=None, min_req=None):
         """Collapse a set of slots into their Pareto frontier of partial
@@ -1087,10 +1581,26 @@ class ExactGearsetOptimizer:
             active_kw_idxs = ()
         has_min_req = any(x > 0 for x in min_req_t)
 
-        max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
-        min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
+        # Active-axis compression: drop any axis that is identically 0.0 across
+        # ALL items and metas in this group (every partial state in this group
+        # has 0.0 on that axis, so omitting it from `dt` is provably exact and
+        # reduces skyline dimensionality from 6-8 down to 3-5!).
+        _raw_max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
+        _raw_min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
+        def _ax_active(ax):
+            for clp in cands_prep:
+                for _it, itv, _itkw in clp:
+                    if itv[ax] != 0.0:
+                        return True
+            for mlp in metas_prep:
+                for _m, _mm, mv, _mkw in mlp:
+                    if mv[ax] != 0.0:
+                        return True
+            return False
+        max_idxs = tuple(ax for ax in _raw_max_idxs if _ax_active(ax))
+        min_idxs = tuple(ax for ax in _raw_min_idxs if _ax_active(ax))
         hv = headroom or {}
-        max_caps = tuple(hv.get(a, None) for a in self.MAX_AXES)
+        max_caps = tuple(hv.get(AXES[ax], None) for ax in max_idxs)
         has_caps = any(c is not None for c in max_caps)
         n_akw = len(active_kw_idxs)
         _add = operator.add
@@ -1268,10 +1778,17 @@ class ExactGearsetOptimizer:
                     return None
         return (g_slots, g_metas), (t_slots, t_metas), (r_slots, r_metas)
 
+    def _mitm_cache_extra_key(self):
+        """Extra objective-specific key component for mitm_cache &
+        tool_frontier_cache (subclasses with weighted axes like ExactCoinsOptimizer
+        override to include self._k)."""
+        return (bool(getattr(self, "_one_time", False)),)
+
     def _make_eval_fns(self, X0, S0, kappa, WE_level, base_stats):
-        """Return (eval_sv, eval_ub_sv, eval_pair) operating on flat AXES-ordered
-        stat tuples. Subclasses override with inlined scalar arithmetic and
-        step/qp caching; this base implementation works for any custom subclass."""
+        """Return (eval_sv, eval_ub_sv, eval_pair, eval_ub_pair) operating on
+        flat AXES-ordered stat tuples. Subclasses override with inlined scalar
+        arithmetic and step/qp caching; this base implementation works for any
+        custom subclass."""
         AXES = self.AXES
         _add = operator.add
         _score = self.score
@@ -1282,7 +1799,7 @@ class ExactGearsetOptimizer:
         def eval_pair(bv, cv):
             return _score(X0, S0, kappa, WE_level, dict(zip(AXES, map(_add, bv, cv))))
 
-        return eval_sv, eval_sv, eval_pair
+        return eval_sv, eval_sv, eval_pair, eval_pair
 
     def _optimize_mitm(self, slots, metas, reqs, X0, S0, kappa, WE_level, base_stats):
         """Meet-in-the-middle: collapse 3 disjoint groups to Pareto frontiers
@@ -1392,11 +1909,15 @@ class ExactGearsetOptimizer:
         def _kw_max(lst):
             return tuple(max(x[1][j] for x in lst) for j in rng_rk)
 
+        def _kw_min(lst):
+            return tuple(min(x[1][j] for x in lst) for j in rng_rk)
+
         if has_reqs:
             for _ in range(2):
                 mG, mT, mR = _kw_max(G), _kw_max(T), _kw_max(R)
-                if any(mG[j] + mT[j] + mR[j] < req_caps[j] for j in rng_rk):
-                    return float("-inf"), None, None
+                for j in rng_rk:
+                    if mG[j] + mT[j] + mR[j] < req_caps[j]:
+                        return float("-inf"), None, None
                 G = [x for x in G if all(x[1][j] + mT[j] + mR[j] >= req_caps[j] for j in rng_rk)]
                 if not G:
                     return float("-inf"), None, None
@@ -1406,8 +1927,27 @@ class ExactGearsetOptimizer:
                 R = [x for x in R if all(mG[j] + mT[j] + x[1][j] >= req_caps[j] for j in rng_rk)]
                 if not R:
                     return float("-inf"), None, None
+            # Drop already-guaranteed requirement dimensions (e.g. diving gear: 3
+            # forced on every state of FG by min_req_g!). When all are guaranteed,
+            # has_reqs becomes False -> zero keyword checks in the hot combine!
+            mnG, mnT, mnR = _kw_min(G), _kw_min(T), _kw_min(R)
+            active_r = tuple(j for j in rng_rk if mnG[j] + mnT[j] + mnR[j] < req_caps[j])
+            if not active_r:
+                has_reqs = False
+                nrk = 0
+                rng_rk = range(0)
+                req_caps = ()
+            elif len(active_r) < nrk:
+                req_caps = tuple(req_caps[j] for j in active_r)
+                G = [(x[0], tuple(x[1][j] for j in active_r), x[2], x[3], x[4]) for x in G]
+                T = [(x[0], tuple(x[1][j] for j in active_r), x[2], x[3], x[4]) for x in T]
+                R = [(x[0], tuple(x[1][j] for j in active_r), x[2], x[3], x[4]) for x in R]
+                nrk = len(active_r)
+                rng_rk = range(nrk)
 
-        eval_sv, eval_ub_sv, eval_pair = self._make_eval_fns(X0, S0, kappa, WE_level, base_stats)
+        eval_sv, eval_ub_sv, eval_pair, eval_ub_pair = self._make_eval_fns(
+            X0, S0, kappa, WE_level, base_stats)
+        req0 = req_caps[0] if nrk == 1 else 0
 
         def _box(lst):
             b = [0.0] * nax
@@ -1428,7 +1968,7 @@ class ExactGearsetOptimizer:
             return tuple(b)
 
         def _attach_ub(lst, other_sum):
-            return [(*x[:5], eval_ub_sv(tuple(map(_add, other_sum, x[0])))) for x in lst]
+            return [(*x[:5], eval_ub_pair(other_sum, x[0])) for x in lst]
 
         boxG, boxT, boxR = _box(G), _box(T), _box(R)
         s0_TR = tuple(map(_add, s0v, map(_add, boxT, boxR)))
@@ -1440,9 +1980,14 @@ class ExactGearsetOptimizer:
 
         best_r = float("-inf"); best_tb = float("-inf"); best_nfill = float("-inf")
         best_load = None; best_sv = None
+        eps_r = float("-inf")
 
-        # Quick seed from top-8 x top-8 x top-8 (plus keyword-heavy fallback if reqs)
-        seed_G = G[:8]; seed_T = T[:8]; seed_R = R[:8]
+        def _upd_eps():
+            nonlocal eps_r
+            eps_r = best_r / (1.0 + 1e-12) if best_r > 0 else best_r * (1.0 + 1e-12)
+
+        # Quick seed from top-10 x top-10 x top-10 (plus keyword-heavy fallback if reqs)
+        seed_G = G[:10]; seed_T = T[:10]; seed_R = R[:10]
         if has_reqs:
             sg_kw = sorted(G, key=lambda x: (sum(x[1]), x[5]), reverse=True)[:4]
             st_kw = sorted(T, key=lambda x: (sum(x[1]), x[5]), reverse=True)[:4]
@@ -1451,13 +1996,31 @@ class ExactGearsetOptimizer:
             seed_T = seed_T + [x for x in st_kw if x not in seed_T]
             seed_R = seed_R + [x for x in sr_kw if x not in seed_R]
 
-        for gv, kG, nfG, tbG, cG, _ in seed_G:
+        for gv, kG, nfG, tbG, cG, ubG in seed_G:
+            if best_load is not None and ubG < eps_r:
+                continue
             s0g = tuple(map(_add, s0v, gv))
-            for tv, kT, nfT, tbT, cT, _ in seed_T:
+            for tv, kT, nfT, tbT, cT, ubT in seed_T:
+                if best_load is not None and ubT < eps_r:
+                    continue
                 s0gt = tuple(map(_add, s0g, tv))
-                for rv, kR, nfR, tbR, cR, _ in seed_R:
-                    if has_reqs and any(kG[j] + kT[j] + kR[j] < req_caps[j] for j in rng_rk):
+                if best_load is not None and eval_ub_pair(s0gt, boxR) < eps_r:
+                    continue
+                for rv, kR, nfR, tbR, cR, ubR in seed_R:
+                    if best_load is not None and ubR < eps_r:
                         continue
+                    if has_reqs:
+                        if nrk == 1:
+                            if kG[0] + kT[0] + kR[0] < req0:
+                                continue
+                        else:
+                            ok = True
+                            for j in rng_rk:
+                                if kG[j] + kT[j] + kR[j] < req_caps[j]:
+                                    ok = False
+                                    break
+                            if not ok:
+                                continue
                     r = eval_pair(s0gt, rv)
                     if r >= best_r:
                         tb = tbG + tbT + tbR; nf = nfG + nfT + nfR
@@ -1465,12 +2028,12 @@ class ExactGearsetOptimizer:
                             best_r = r; best_tb = tb; best_nfill = nf
                             best_load = list(cG) + list(cT) + list(cR)
                             best_sv = tuple(map(_add, s0gt, rv))
+                            _upd_eps()
 
         # Iterative 3-way objective-bound tightening (up to 3 rounds)
         if best_load is not None:
             for _rnd in range(3):
                 prev_tot = len(G) + len(T) + len(R)
-                eps_r = best_r / (1.0 + 1e-12) if best_r > 0 else best_r * (1.0 + 1e-12)
                 G = [x for x in G if x[5] >= eps_r]
                 T = [x for x in T if x[5] >= eps_r]
                 R = [x for x in R if x[5] >= eps_r]
@@ -1492,83 +2055,125 @@ class ExactGearsetOptimizer:
         groups_sorted = sorted((G, T, R), key=len)
         A, B, C = groups_sorted
 
+        # Adaptive AB materialization: build box-filtered AB when product <= 16384
+        # AND surviving AB stays <= AB_MAX (otherwise abort into zero-merge 3-way
+        # Dual-Tree so high-dimensional 7D/8D cases never stall on AB pruning).
+        _AB_MAX = 2500
+        ab_built = False
+        AB = []
         if len(A) * len(B) <= 16384:
-            # Build box-filtered AB (skipping dominated A*B blocks against boxC),
-            # Pareto-collapse tiny AB if >64, sharpen incumbent, and run Dual-Tree
-            # blocks_AB x blocks_C with max_ub early-break.
             boxC = _box(C)
             s0_C = tuple(map(_add, s0v, boxC))
             mC = _kw_max(C) if has_reqs else ()
-            AB = []
+            ab_ok = True
             if len(A) * len(B) > 256:
                 bA_list = self._build_kd_blocks(A, max_idxs, min_idxs, has_reqs, nrk, leaf_size=16, with_ub=True)
                 bB_list = self._build_kd_blocks(B, max_idxs, min_idxs, has_reqs, nrk, leaf_size=24, with_ub=True)
                 for a_mub, a_box, a_kw, a_items in bA_list:
-                    if best_load is not None and a_mub * (1.0 + 1e-12) < best_r:
+                    if not ab_ok:
+                        break
+                    if best_load is not None and a_mub < eps_r:
                         break
                     s0C_a_box = tuple(map(_add, s0_C, a_box))
                     for b_mub, b_box, b_kw, b_items in bB_list:
-                        if best_load is not None and b_mub * (1.0 + 1e-12) < best_r:
+                        if best_load is not None and b_mub < eps_r:
                             break
-                        if has_reqs and any(a_kw[j] + b_kw[j] + mC[j] < req_caps[j] for j in rng_rk):
+                        if has_reqs:
+                            if nrk == 1:
+                                if a_kw[0] + b_kw[0] + mC[0] < req0:
+                                    continue
+                            else:
+                                ok = True
+                                for j in rng_rk:
+                                    if a_kw[j] + b_kw[j] + mC[j] < req_caps[j]:
+                                        ok = False
+                                        break
+                                if not ok:
+                                    continue
+                        if best_load is not None and eval_ub_pair(s0C_a_box, b_box) < eps_r:
                             continue
-                        if best_load is not None:
-                            if eval_ub_sv(tuple(map(_add, s0C_a_box, b_box))) * (1.0 + 1e-12) < best_r:
-                                continue
                         s0C_b_box = tuple(map(_add, s0_C, b_box))
                         for av, kA, nfA, tbA, cA, ubA in a_items:
-                            if best_load is not None and ubA * (1.0 + 1e-12) < best_r:
-                                continue
-                            if has_reqs and any(kA[j] + b_kw[j] + mC[j] < req_caps[j] for j in rng_rk):
-                                continue
-                            if best_load is not None:
-                                if eval_ub_sv(tuple(map(_add, s0C_b_box, av))) * (1.0 + 1e-12) < best_r:
-                                    continue
-                            s0C_a = tuple(map(_add, s0_C, av))
-                            for bv, kB, nfB, tbB, cB, ubB in b_items:
-                                if best_load is not None and ubB * (1.0 + 1e-12) < best_r:
-                                    continue
-                                if has_reqs:
+                            if best_load is not None and ubA < eps_r:
+                                break
+                            if has_reqs:
+                                if nrk == 1:
+                                    if kA[0] + b_kw[0] + mC[0] < req0:
+                                        continue
+                                else:
                                     ok = True
                                     for j in rng_rk:
-                                        if kA[j] + kB[j] + mC[j] < req_caps[j]:
+                                        if kA[j] + b_kw[j] + mC[j] < req_caps[j]:
                                             ok = False
                                             break
                                     if not ok:
                                         continue
-                                    kAB = tuple(min(kA[j] + kB[j], req_caps[j]) for j in rng_rk)
+                            if best_load is not None and eval_ub_pair(s0C_b_box, av) < eps_r:
+                                continue
+                            s0C_a = tuple(map(_add, s0_C, av))
+                            for bv, kB, nfB, tbB, cB, ubB in b_items:
+                                if best_load is not None and ubB < eps_r:
+                                    break
+                                if has_reqs:
+                                    if nrk == 1:
+                                        if kA[0] + kB[0] + mC[0] < req0:
+                                            continue
+                                        s_k0 = kA[0] + kB[0]
+                                        kAB = (req0 if s_k0 > req0 else s_k0,)
+                                    else:
+                                        ok = True
+                                        for j in rng_rk:
+                                            if kA[j] + kB[j] + mC[j] < req_caps[j]:
+                                                ok = False
+                                                break
+                                        if not ok:
+                                            continue
+                                        kAB = tuple(min(kA[j] + kB[j], req_caps[j]) for j in rng_rk)
                                 else:
                                     kAB = ()
-                                ub = eval_ub_sv(tuple(map(_add, s0C_a, bv)))
-                                if best_load is not None and ub * (1.0 + 1e-12) < best_r:
+                                ub = eval_ub_pair(s0C_a, bv)
+                                if best_load is not None and ub < eps_r:
                                     continue
                                 AB.append((tuple(map(_add, av, bv)), kAB, nfA + nfB, tbA + tbB, cA + cB, ub))
+                            if len(AB) > _AB_MAX:
+                                ab_ok = False
+                                break
+                        if not ab_ok:
+                            break
             else:
                 for av, kA, nfA, tbA, cA, _ in A:
                     s0C_a = tuple(map(_add, s0_C, av))
                     for bv, kB, nfB, tbB, cB, _ in B:
                         if has_reqs:
-                            ok = True
-                            for j in rng_rk:
-                                if kA[j] + kB[j] + mC[j] < req_caps[j]:
-                                    ok = False
-                                    break
-                            if not ok:
-                                continue
-                            kAB = tuple(min(kA[j] + kB[j], req_caps[j]) for j in rng_rk)
+                            if nrk == 1:
+                                if kA[0] + kB[0] + mC[0] < req0:
+                                    continue
+                                s_k0 = kA[0] + kB[0]
+                                kAB = (req0 if s_k0 > req0 else s_k0,)
+                            else:
+                                ok = True
+                                for j in rng_rk:
+                                    if kA[j] + kB[j] + mC[j] < req_caps[j]:
+                                        ok = False
+                                        break
+                                if not ok:
+                                    continue
+                                kAB = tuple(min(kA[j] + kB[j], req_caps[j]) for j in rng_rk)
                         else:
                             kAB = ()
-                        ub = eval_ub_sv(tuple(map(_add, s0C_a, bv)))
-                        if best_load is not None and ub * (1.0 + 1e-12) < best_r:
+                        ub = eval_ub_pair(s0C_a, bv)
+                        if best_load is not None and ub < eps_r:
                             continue
                         AB.append((tuple(map(_add, av, bv)), kAB, nfA + nfB, tbA + tbB, cA + cB, ub))
+            ab_built = ab_ok
 
+        if ab_built:
             if not AB:
                 if best_load is None:
                     return float("-inf"), None, None
                 return best_r, best_load, dict(zip(AXES, best_sv))
 
-            # Pareto-collapse surviving AB if non-trivial (fast: already filtered by ub>=best_r!)
+            # Pareto-collapse surviving AB if non-trivial
             if len(AB) > 64:
                 ab_sfs = []
                 for abv, kAB, nfAB, tbAB, cAB, ubAB in AB:
@@ -1584,11 +2189,25 @@ class ExactGearsetOptimizer:
 
             AB.sort(key=lambda x: x[5], reverse=True)
             # Second seed pass on top-16 AB x top-16 C to sharpen best_r
-            for abv, kAB, nfAB, tbAB, cAB, _ in AB[:16]:
+            for abv, kAB, nfAB, tbAB, cAB, ubAB in AB[:16]:
+                if best_load is not None and ubAB < eps_r:
+                    break
                 s0_ab = tuple(map(_add, s0v, abv))
-                for cv, kC, nfC, tbC, cC, _ in C[:16]:
-                    if has_reqs and any(kAB[j] + kC[j] < req_caps[j] for j in rng_rk):
-                        continue
+                for cv, kC, nfC, tbC, cC, ubC in C[:16]:
+                    if best_load is not None and ubC < eps_r:
+                        break
+                    if has_reqs:
+                        if nrk == 1:
+                            if kAB[0] + kC[0] < req0:
+                                continue
+                        else:
+                            ok = True
+                            for j in rng_rk:
+                                if kAB[j] + kC[j] < req_caps[j]:
+                                    ok = False
+                                    break
+                            if not ok:
+                                continue
                     r = eval_pair(s0_ab, cv)
                     if r >= best_r:
                         tb = tbAB + tbC; nf = nfAB + nfC
@@ -1596,41 +2215,71 @@ class ExactGearsetOptimizer:
                             best_r = r; best_tb = tb; best_nfill = nf
                             best_load = list(cAB) + list(cC)
                             best_sv = tuple(map(_add, s0_ab, cv))
+                            _upd_eps()
 
             if best_load is not None:
-                eps_r = best_r / (1.0 + 1e-12) if best_r > 0 else best_r * (1.0 + 1e-12)
                 AB = [x for x in AB if x[5] >= eps_r]
                 C = [x for x in C if x[5] >= eps_r]
                 if not AB or not C:
                     return best_r, best_load, dict(zip(AXES, best_sv))
 
-            blocks_AB = self._build_kd_blocks(AB, max_idxs, min_idxs, has_reqs, nrk, leaf_size=24, with_ub=True)
-            blocks_C = self._build_kd_blocks(C, max_idxs, min_idxs, has_reqs, nrk, leaf_size=24, with_ub=True)
+            # Pre-shift AB by +s0v ONCE so every tree box and leaf item avoids
+            # per-node tuple(map(_add, s0v, ...)) allocations!
+            s0_AB = [(tuple(map(_add, s0v, x[0])), x[1], x[2], x[3], x[4], x[5]) for x in AB]
+            tree_AB = self._build_kd_tree(s0_AB, max_idxs, min_idxs, has_reqs, nrk, leaf_size=12)
+            tree_C = self._build_kd_tree(C, max_idxs, min_idxs, has_reqs, nrk, leaf_size=12)
 
-            for ab_mub, ab_box, ab_kw, ab_items in blocks_AB:
-                if best_load is not None and ab_mub * (1.0 + 1e-12) < best_r:
-                    break
-                s0_ab_box = tuple(map(_add, s0v, ab_box))
-                for c_mub, c_box, c_kw, c_items in blocks_C:
-                    if best_load is not None and c_mub * (1.0 + 1e-12) < best_r:
-                        break
-                    if has_reqs and any(ab_kw[j] + c_kw[j] < req_caps[j] for j in rng_rk):
-                        continue
-                    if best_load is not None:
-                        if eval_ub_sv(tuple(map(_add, s0_ab_box, c_box))) * (1.0 + 1e-12) < best_r:
+            def _visit_2way(nA, nC):
+                nonlocal best_r, best_tb, best_nfill, best_load, best_sv, eps_r
+                if best_load is not None:
+                    if nA[0] < eps_r or nC[0] < eps_r:
+                        return
+                if has_reqs:
+                    a_kw = nA[2]; c_kw = nC[2]
+                    if nrk == 1:
+                        if a_kw[0] + c_kw[0] < req0:
+                            return
+                    else:
+                        for j in rng_rk:
+                            if a_kw[j] + c_kw[j] < req_caps[j]:
+                                return
+                if best_load is not None and eval_ub_pair(nA[1], nC[1]) < eps_r:
+                    return
+                a_items = nA[5]; c_items = nC[5]
+                if a_items is not None and c_items is not None:
+                    c_box = nC[1]; c_kw = nC[2]
+                    for s0_ab, kAB, nfAB, tbAB, cAB, ubAB in a_items:
+                        if best_load is not None and ubAB < eps_r:
+                            break
+                        if has_reqs:
+                            if nrk == 1:
+                                if kAB[0] + c_kw[0] < req0:
+                                    continue
+                            else:
+                                ok = True
+                                for j in rng_rk:
+                                    if kAB[j] + c_kw[j] < req_caps[j]:
+                                        ok = False
+                                        break
+                                if not ok:
+                                    continue
+                        if best_load is not None and eval_ub_pair(s0_ab, c_box) < eps_r:
                             continue
-                    for abv, kAB, nfAB, tbAB, cAB, ubAB in ab_items:
-                        if best_load is not None and ubAB * (1.0 + 1e-12) < best_r:
-                            continue
-                        if has_reqs and any(kAB[j] + c_kw[j] < req_caps[j] for j in rng_rk):
-                            continue
-                        s0_ab = tuple(map(_add, s0v, abv))
-                        if best_load is not None:
-                            if eval_ub_sv(tuple(map(_add, s0_ab, c_box))) * (1.0 + 1e-12) < best_r:
-                                continue
-                        for cv, kC, nfC, tbC, cC, _ in c_items:
-                            if has_reqs and any(kAB[j] + kC[j] < req_caps[j] for j in rng_rk):
-                                continue
+                        for cv, kC, nfC, tbC, cC, ubC in c_items:
+                            if best_load is not None and ubC < eps_r:
+                                break
+                            if has_reqs:
+                                if nrk == 1:
+                                    if kAB[0] + kC[0] < req0:
+                                        continue
+                                else:
+                                    ok = True
+                                    for j in rng_rk:
+                                        if kAB[j] + kC[j] < req_caps[j]:
+                                            ok = False
+                                            break
+                                    if not ok:
+                                        continue
                             r = eval_pair(s0_ab, cv)
                             if r >= best_r:
                                 tb = tbAB + tbC; nf = nfAB + nfC
@@ -1638,58 +2287,114 @@ class ExactGearsetOptimizer:
                                     best_r = r; best_tb = tb; best_nfill = nf
                                     best_load = list(cAB) + list(cC)
                                     best_sv = tuple(map(_add, s0_ab, cv))
+                                    _upd_eps()
+                elif a_items is None and (c_items is not None or nA[6] >= nC[6]):
+                    _visit_2way(nA[3], nC)
+                    _visit_2way(nA[4], nC)
+                else:
+                    _visit_2way(nA, nC[3])
+                    _visit_2way(nA, nC[4])
+
+            _visit_2way(tree_AB, tree_C)
         else:
             # Direct 3-level Dual-Tree KD-block branch-and-bound (zero merge!)
             boxC = _box(C)
             mC = _kw_max(C) if has_reqs else ()
-            blocks_A = self._build_kd_blocks(A, max_idxs, min_idxs, has_reqs, nrk, leaf_size=16, with_ub=True)
-            blocks_B = self._build_kd_blocks(B, max_idxs, min_idxs, has_reqs, nrk, leaf_size=24, with_ub=True)
-            blocks_C = self._build_kd_blocks(C, max_idxs, min_idxs, has_reqs, nrk, leaf_size=24, with_ub=True)
+            s0_A = [(tuple(map(_add, s0v, x[0])), x[1], x[2], x[3], x[4], x[5]) for x in A]
+            blocks_A = self._build_kd_blocks(s0_A, max_idxs, min_idxs, has_reqs, nrk, leaf_size=12, with_ub=True)
+            blocks_B = self._build_kd_blocks(B, max_idxs, min_idxs, has_reqs, nrk, leaf_size=16, with_ub=True)
+            blocks_C = self._build_kd_blocks(C, max_idxs, min_idxs, has_reqs, nrk, leaf_size=16, with_ub=True)
 
-            for a_mub, a_box, a_kw, a_items in blocks_A:
-                if best_load is not None and a_mub * (1.0 + 1e-12) < best_r:
+            for a_mub, s0_a_box, a_kw, a_items in blocks_A:
+                if best_load is not None and a_mub < eps_r:
                     break
-                s0_a_box = tuple(map(_add, s0v, a_box))
                 for b_mub, b_box, b_kw, b_items in blocks_B:
-                    if best_load is not None and b_mub * (1.0 + 1e-12) < best_r:
+                    if best_load is not None and b_mub < eps_r:
                         break
-                    if has_reqs and any(a_kw[j] + b_kw[j] + mC[j] < req_caps[j] for j in rng_rk):
-                        continue
+                    if has_reqs:
+                        if nrk == 1:
+                            if a_kw[0] + b_kw[0] + mC[0] < req0:
+                                continue
+                        else:
+                            ok = True
+                            for j in rng_rk:
+                                if a_kw[j] + b_kw[j] + mC[j] < req_caps[j]:
+                                    ok = False
+                                    break
+                            if not ok:
+                                continue
                     s0_ab_box = tuple(map(_add, s0_a_box, b_box))
-                    if best_load is not None:
-                        if eval_ub_sv(tuple(map(_add, s0_ab_box, boxC))) * (1.0 + 1e-12) < best_r:
-                            continue
+                    if best_load is not None and eval_ub_pair(s0_ab_box, boxC) < eps_r:
+                        continue
                     for c_mub, c_box, c_kw, c_items in blocks_C:
-                        if best_load is not None and c_mub * (1.0 + 1e-12) < best_r:
+                        if best_load is not None and c_mub < eps_r:
                             break
-                        if has_reqs and any(a_kw[j] + b_kw[j] + c_kw[j] < req_caps[j] for j in rng_rk):
+                        if has_reqs:
+                            if nrk == 1:
+                                if a_kw[0] + b_kw[0] + c_kw[0] < req0:
+                                    continue
+                            else:
+                                ok = True
+                                for j in rng_rk:
+                                    if a_kw[j] + b_kw[j] + c_kw[j] < req_caps[j]:
+                                        ok = False
+                                        break
+                                if not ok:
+                                    continue
+                        if best_load is not None and eval_ub_pair(s0_ab_box, c_box) < eps_r:
                             continue
-                        if best_load is not None:
-                            if eval_ub_sv(tuple(map(_add, s0_ab_box, c_box))) * (1.0 + 1e-12) < best_r:
-                                continue
                         bc_box = tuple(map(_add, b_box, c_box))
-                        for av, kA, nfA, tbA, cA, ubA in a_items:
-                            if best_load is not None and ubA * (1.0 + 1e-12) < best_r:
+                        for s0_a, kA, nfA, tbA, cA, ubA in a_items:
+                            if best_load is not None and ubA < eps_r:
+                                break
+                            if has_reqs:
+                                if nrk == 1:
+                                    if kA[0] + b_kw[0] + c_kw[0] < req0:
+                                        continue
+                                else:
+                                    ok = True
+                                    for j in rng_rk:
+                                        if kA[j] + b_kw[j] + c_kw[j] < req_caps[j]:
+                                            ok = False
+                                            break
+                                    if not ok:
+                                        continue
+                            if best_load is not None and eval_ub_pair(s0_a, bc_box) < eps_r:
                                 continue
-                            if has_reqs and any(kA[j] + b_kw[j] + c_kw[j] < req_caps[j] for j in rng_rk):
-                                continue
-                            s0_a = tuple(map(_add, s0v, av))
-                            if best_load is not None:
-                                if eval_ub_sv(tuple(map(_add, s0_a, bc_box))) * (1.0 + 1e-12) < best_r:
-                                    continue
                             for bv, kB, nfB, tbB, cB, ubB in b_items:
-                                if best_load is not None and ubB * (1.0 + 1e-12) < best_r:
-                                    continue
-                                if has_reqs and any(kA[j] + kB[j] + c_kw[j] < req_caps[j] for j in rng_rk):
-                                    continue
+                                if best_load is not None and ubB < eps_r:
+                                    break
+                                if has_reqs:
+                                    if nrk == 1:
+                                        if kA[0] + kB[0] + c_kw[0] < req0:
+                                            continue
+                                    else:
+                                        ok = True
+                                        for j in rng_rk:
+                                            if kA[j] + kB[j] + c_kw[j] < req_caps[j]:
+                                                ok = False
+                                                break
+                                        if not ok:
+                                            continue
                                 s0_ab = tuple(map(_add, s0_a, bv))
-                                if best_load is not None:
-                                    if eval_ub_sv(tuple(map(_add, s0_ab, c_box))) * (1.0 + 1e-12) < best_r:
-                                        continue
+                                if best_load is not None and eval_ub_pair(s0_ab, c_box) < eps_r:
+                                    continue
                                 nfAB = nfA + nfB; tbAB = tbA + tbB
-                                for cv, kC, nfC, tbC, cC, _ in c_items:
-                                    if has_reqs and any(kA[j] + kB[j] + kC[j] < req_caps[j] for j in rng_rk):
-                                        continue
+                                for cv, kC, nfC, tbC, cC, ubC in c_items:
+                                    if best_load is not None and ubC < eps_r:
+                                        break
+                                    if has_reqs:
+                                        if nrk == 1:
+                                            if kA[0] + kB[0] + kC[0] < req0:
+                                                continue
+                                        else:
+                                            ok = True
+                                            for j in rng_rk:
+                                                if kA[j] + kB[j] + kC[j] < req_caps[j]:
+                                                    ok = False
+                                                    break
+                                            if not ok:
+                                                continue
                                     r = eval_pair(s0_ab, cv)
                                     if r >= best_r:
                                         tb = tbAB + tbC; nf = nfAB + nfC
@@ -1697,6 +2402,7 @@ class ExactGearsetOptimizer:
                                             best_r = r; best_tb = tb; best_nfill = nf
                                             best_load = list(cA) + list(cB) + list(cC)
                                             best_sv = tuple(map(_add, s0_ab, cv))
+                                            _upd_eps()
 
         if best_load is None:
             return float("-inf"), None, None
@@ -2156,6 +2862,7 @@ class ExactGearsetOptimizer:
                 self._frontier_key(character, skill, location, reqs, pets, consumables),
                 int(n_tools),
                 tuple(self.AXES), tuple(self.MAX_AXES), tuple(self.MIN_AXES),
+                self._mitm_cache_extra_key(),
                 round(float(kappa), 8), round(float(WE_level), 8),
                 tuple((a, round(float(_base_pre.get(a, 0.0)), 8)) for a in AXES),
                 _kwlr,
@@ -2174,35 +2881,35 @@ class ExactGearsetOptimizer:
         def _tool_tokens(kws_lower):
             return frozenset(kw for kw in kws_lower if kw not in _excluded_kw)
 
-        by_slot = defaultdict(list)
-        owned_qty = {}
-        for it, qty in character.items.items():
-            if not qty or not hasattr(it, "get_stats_for_skill") or not hasattr(it, "slot"):
-                continue
-            if getattr(it, "slot", None) is None:
-                continue
-            if hasattr(it, "is_unlocked"):
-                try:
-                    if not it.is_unlocked(character, ignore_gear_requirements=True):
-                        continue
-                except Exception:
-                    pass
-            owned_qty[_item_id(it)] = qty
-            by_slot[it.slot].append(it)
-
-        # Keep only the highest quality per base item for single-occupancy slots
-        # (gear / tools). Lower qualities are strictly dominated and only bloat
-        # the pool — and after the quality-aware _item_id change they're distinct
-        # candidates, so without this the tool pool could fill slots with several
-        # qualities of the SAME base tool (Normal+Good+Great+Perfect Wanderlust
-        # walking stick). filter_items_by_quality keeps the top 2 for rings (dual
-        # ring slots), preserving the excellent+good ring-pairing fix.
         from util.optimization_utils import (
             filter_items_by_quality,
             filter_items_failing_keyword_level_requirements,
         )
-        for _sl in list(by_slot.keys()):
-            by_slot[_sl] = filter_items_by_quality(by_slot[_sl], keep_highest_only=True)
+        _bs_cache = _mcache.setdefault("__by_slot__", {}) if _mcache is not None else None
+        _bs_hit = _bs_cache.get(id(character)) if _bs_cache is not None else None
+        if _bs_hit is not None:
+            _cached_by_slot, owned_qty = _bs_hit
+            by_slot = {sl: list(lst) for sl, lst in _cached_by_slot.items()}
+        else:
+            by_slot = defaultdict(list)
+            owned_qty = {}
+            for it, qty in character.items.items():
+                if not qty or not hasattr(it, "get_stats_for_skill") or not hasattr(it, "slot"):
+                    continue
+                if getattr(it, "slot", None) is None:
+                    continue
+                if hasattr(it, "is_unlocked"):
+                    try:
+                        if not it.is_unlocked(character, ignore_gear_requirements=True):
+                            continue
+                    except Exception:
+                        pass
+                owned_qty[_item_id(it)] = qty
+                by_slot[it.slot].append(it)
+            for _sl in list(by_slot.keys()):
+                by_slot[_sl] = filter_items_by_quality(by_slot[_sl], keep_highest_only=True)
+            if _bs_cache is not None:
+                _bs_cache[id(character)] = ({sl: list(lst) for sl, lst in by_slot.items()}, owned_qty)
 
         # Drop candidates that can never satisfy the activity's tool
         # keyword-level requirement (e.g. a Mining-40 Tarsilium pickaxe for
@@ -2212,9 +2919,11 @@ class ExactGearsetOptimizer:
         # picks it whenever it out-scores a valid pickaxe and the report shows
         # an impossible gearset. Tool-keyword uniqueness guarantees only one
         # such tool is ever worn, so removing the under-level ones is exact.
-        for _sl in list(by_slot.keys()):
-            by_slot[_sl] = filter_items_failing_keyword_level_requirements(
-                by_slot[_sl], activity)
+        _has_kwlr = bool((getattr(activity, "requirements", {}) or {}).get("keyword_level_requirements"))
+        if _has_kwlr:
+            for _sl in list(by_slot.keys()):
+                by_slot[_sl] = filter_items_failing_keyword_level_requirements(
+                    by_slot[_sl], activity)
 
         refs_single = {}; refs_meta = {}; refs_pool = {}
 
@@ -2249,28 +2958,33 @@ class ExactGearsetOptimizer:
 
         def pool_frontier(items, K, headroom=None):
             """Exact tool-bundle Pareto DP with:
-              1. Bitmask conflict tokens (unique tokens ignored completely).
-              2. Conflict-grouped item ordering + dead-token masking (tokens
-                 that cannot appear on any remaining tool are cleared immediately).
+              1. Active-axis compression (axes identically 0 across all tools are
+                 dropped from dominance tuples -> shrinks _PLEN from 7-9 to 2-5).
+              2. Bitmask conflict tokens + conflict-component ordering + dead-token
+                 masking + O(1) block/size-level `ban_and` skipping.
               3. Terminal (size == K) ban-free collapse during DP.
-              4. Flat-tuple SFS (Sort-Filter-Skyline) Pareto merge.
-              5. Final ban-free & size-free Pareto prune with empty output
-                 tokens (tool tokens never affect any non-tool slot)."""
+              4. Unrolled `_PLEN in 1..8` bucketed+blocked dominance + persistent
+                 index across tool merges (avoids rebuilding fr_blocks each step).
+              5. Final ban-free & size-free Pareto prune with empty output tokens."""
             _PMAXA = self.MAX_AXES; _PMINA = self.MIN_AXES
             # Only track req keywords actually carried by >=1 tool in `items`
             _PRK = tuple(k for k in reqs if any(k in it.keywords for it in items))
             nax = len(AXES)
             nrk = len(_PRK)
             req_caps = tuple(reqs[k] for k in _PRK)
-            max_idxs = tuple(AXES.index(a) for a in _PMAXA)
-            min_idxs = tuple(AXES.index(a) for a in _PMINA)
+            # Active-axis compression: drop axes identically 0 across all tools
+            max_idxs = tuple(AXES.index(a) for a in _PMAXA
+                             if any(it.stats.get(a, 0.0) != 0.0 for it in items))
+            min_idxs = tuple(AXES.index(a) for a in _PMINA
+                             if any(it.stats.get(a, 0.0) != 0.0 for it in items))
             _HV = headroom or {}
-            max_caps = tuple(_HV.get(a, None) for a in _PMAXA)
+            max_caps = tuple(_HV.get(AXES[ax], None) for ax in max_idxs)
             has_caps = any(c is not None for c in max_caps)
             _PLEN = len(max_idxs) + len(min_idxs) + nrk
             _add = operator.add
             _cap_pairs = tuple(zip(max_idxs, max_caps))
             rng_rk = range(nrk)
+            rng_p = range(_PLEN)
 
             # Identify tokens that appear on >= 2 tools (unique tokens can never conflict)
             tok_counts = defaultdict(int)
@@ -2336,32 +3050,35 @@ class ExactGearsetOptimizer:
                     dt_l.extend(kwt)
                 return tuple(dt_l), sum(dt_l)
 
-            def _add_pool_idx(gmax_sz, blocks_sz, s):
-                sdt = s[0]; sz = s[2]
-                entry = (sdt, s[1], s[6])
+            def _add_pool_idx(gmax_sz, blocks_sz, sz_ban_and, s):
+                sdt = s[0]; s_ban = s[1]; sz = s[2]
+                entry = (sdt, s_ban, s[6])
                 blks = blocks_sz[sz]
-                if not blks or len(blks[-1][1]) >= 64:
-                    blks.append([list(sdt), [entry]])
+                if not blks or len(blks[-1][2]) >= 64:
+                    blks.append([list(sdt), s_ban, [entry]])
                 else:
                     blk = blks[-1]
                     bm = blk[0]
-                    for j in range(_PLEN):
+                    for j in rng_p:
                         if sdt[j] > bm[j]:
                             bm[j] = sdt[j]
-                    blk[1].append(entry)
+                    blk[1] &= s_ban
+                    blk[2].append(entry)
                 gm = gmax_sz[sz]
                 if gm is None:
                     gmax_sz[sz] = list(sdt)
+                    sz_ban_and[sz] = s_ban
                 else:
-                    for j in range(_PLEN):
+                    for j in rng_p:
                         if sdt[j] > gm[j]:
                             gm[j] = sdt[j]
+                    sz_ban_and[sz] &= s_ban
 
             def _remove_pool_idx(blocks_sz, k):
                 sz = k[2]; entry = (k[0], k[1], k[6])
                 blks = blocks_sz[sz]
                 for bi in range(len(blks) - 1, -1, -1):
-                    bitems = blks[bi][1]
+                    bitems = blks[bi][2]
                     try:
                         bitems.remove(entry)
                         if not bitems:
@@ -2370,84 +3087,82 @@ class ExactGearsetOptimizer:
                     except ValueError:
                         continue
 
-            # Dispatch _PLEN ONCE per pool_frontier call to avoid per-comparison branches
-            if _PLEN == 6:
-                def _is_dom_pool(gmax_sz, blocks_sz, adt, a_ban, a_sz, a_tb):
-                    a0, a1, a2, a3, a4, a5 = adt
+            # Dispatch _PLEN ONCE per pool_frontier call (unrolled 1..8, zero genexprs)
+            if _PLEN == 3:
+                def _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, adt, a_ban, a_sz, a_tb):
+                    a0, a1, a2 = adt
                     a_nonterm = (a_sz < K)
                     hi_sz = K if not a_nonterm else a_sz
+                    na_ban = ~a_ban
                     for sz in range(hi_sz + 1):
                         gm = gmax_sz[sz]
-                        if (gm is None or a0 > gm[0] or a1 > gm[1] or a2 > gm[2]
-                                or a3 > gm[3] or a4 > gm[4] or a5 > gm[5]):
+                        if gm is None or (a_nonterm and (sz_ban_and[sz] & na_ban)):
                             continue
-                        for bm, bitems in blocks_sz[sz]:
-                            if (bm[0] < a0 or bm[1] < a1 or bm[2] < a2
-                                    or bm[3] < a3 or bm[4] < a4 or bm[5] < a5):
+                        if a0 > gm[0] or a1 > gm[1] or a2 > gm[2]:
+                            continue
+                        for bm, bba, bitems in blocks_sz[sz]:
+                            if (a_nonterm and (bba & na_ban)) or bm[0] < a0 or bm[1] < a1 or bm[2] < a2:
                                 continue
                             if a_nonterm:
                                 for kdt, kban, ktb in bitems:
-                                    if (kban & ~a_ban):
+                                    if (kban & na_ban):
                                         continue
-                                    if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
-                                            and kdt[3] >= a3 and kdt[4] >= a4 and kdt[5] >= a5):
+                                    if kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2:
                                         if not (ktb < a_tb and kdt == adt):
                                             return True
                             else:
                                 for kdt, _kban, ktb in bitems:
-                                    if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
-                                            and kdt[3] >= a3 and kdt[4] >= a4 and kdt[5] >= a5):
+                                    if kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2:
                                         if not (ktb < a_tb and kdt == adt):
                                             return True
                     return False
-            elif _PLEN == 7:
-                def _is_dom_pool(gmax_sz, blocks_sz, adt, a_ban, a_sz, a_tb):
-                    a0, a1, a2, a3, a4, a5, a6 = adt
+            elif _PLEN == 4:
+                def _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, adt, a_ban, a_sz, a_tb):
+                    a0, a1, a2, a3 = adt
                     a_nonterm = (a_sz < K)
                     hi_sz = K if not a_nonterm else a_sz
+                    na_ban = ~a_ban
                     for sz in range(hi_sz + 1):
                         gm = gmax_sz[sz]
-                        if (gm is None or a0 > gm[0] or a1 > gm[1] or a2 > gm[2]
-                                or a3 > gm[3] or a4 > gm[4] or a5 > gm[5] or a6 > gm[6]):
+                        if gm is None or (a_nonterm and (sz_ban_and[sz] & na_ban)):
                             continue
-                        for bm, bitems in blocks_sz[sz]:
-                            if (bm[0] < a0 or bm[1] < a1 or bm[2] < a2
-                                    or bm[3] < a3 or bm[4] < a4 or bm[5] < a5 or bm[6] < a6):
+                        if a0 > gm[0] or a1 > gm[1] or a2 > gm[2] or a3 > gm[3]:
+                            continue
+                        for bm, bba, bitems in blocks_sz[sz]:
+                            if (a_nonterm and (bba & na_ban)) or bm[0] < a0 or bm[1] < a1 or bm[2] < a2 or bm[3] < a3:
                                 continue
                             if a_nonterm:
                                 for kdt, kban, ktb in bitems:
-                                    if (kban & ~a_ban):
+                                    if (kban & na_ban):
                                         continue
-                                    if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
-                                            and kdt[3] >= a3 and kdt[4] >= a4 and kdt[5] >= a5
-                                            and kdt[6] >= a6):
+                                    if kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2 and kdt[3] >= a3:
                                         if not (ktb < a_tb and kdt == adt):
                                             return True
                             else:
                                 for kdt, _kban, ktb in bitems:
-                                    if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
-                                            and kdt[3] >= a3 and kdt[4] >= a4 and kdt[5] >= a5
-                                            and kdt[6] >= a6):
+                                    if kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2 and kdt[3] >= a3:
                                         if not (ktb < a_tb and kdt == adt):
                                             return True
                     return False
             elif _PLEN == 5:
-                def _is_dom_pool(gmax_sz, blocks_sz, adt, a_ban, a_sz, a_tb):
+                def _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, adt, a_ban, a_sz, a_tb):
                     a0, a1, a2, a3, a4 = adt
                     a_nonterm = (a_sz < K)
                     hi_sz = K if not a_nonterm else a_sz
+                    na_ban = ~a_ban
                     for sz in range(hi_sz + 1):
                         gm = gmax_sz[sz]
-                        if (gm is None or a0 > gm[0] or a1 > gm[1] or a2 > gm[2]
-                                or a3 > gm[3] or a4 > gm[4]):
+                        if gm is None or (a_nonterm and (sz_ban_and[sz] & na_ban)):
                             continue
-                        for bm, bitems in blocks_sz[sz]:
-                            if (bm[0] < a0 or bm[1] < a1 or bm[2] < a2
-                                    or bm[3] < a3 or bm[4] < a4):
+                        if a0 > gm[0] or a1 > gm[1] or a2 > gm[2] or a3 > gm[3] or a4 > gm[4]:
+                            continue
+                        for bm, bba, bitems in blocks_sz[sz]:
+                            if ((a_nonterm and (bba & na_ban)) or bm[0] < a0 or bm[1] < a1
+                                    or bm[2] < a2 or bm[3] < a3 or bm[4] < a4):
                                 continue
                             if a_nonterm:
                                 for kdt, kban, ktb in bitems:
-                                    if (kban & ~a_ban):
+                                    if (kban & na_ban):
                                         continue
                                     if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
                                             and kdt[3] >= a3 and kdt[4] >= a4):
@@ -2460,25 +3175,147 @@ class ExactGearsetOptimizer:
                                         if not (ktb < a_tb and kdt == adt):
                                             return True
                     return False
+            elif _PLEN == 6:
+                def _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, adt, a_ban, a_sz, a_tb):
+                    a0, a1, a2, a3, a4, a5 = adt
+                    a_nonterm = (a_sz < K)
+                    hi_sz = K if not a_nonterm else a_sz
+                    na_ban = ~a_ban
+                    for sz in range(hi_sz + 1):
+                        gm = gmax_sz[sz]
+                        if gm is None or (a_nonterm and (sz_ban_and[sz] & na_ban)):
+                            continue
+                        if (a0 > gm[0] or a1 > gm[1] or a2 > gm[2]
+                                or a3 > gm[3] or a4 > gm[4] or a5 > gm[5]):
+                            continue
+                        for bm, bba, bitems in blocks_sz[sz]:
+                            if ((a_nonterm and (bba & na_ban)) or bm[0] < a0 or bm[1] < a1
+                                    or bm[2] < a2 or bm[3] < a3 or bm[4] < a4 or bm[5] < a5):
+                                continue
+                            if a_nonterm:
+                                for kdt, kban, ktb in bitems:
+                                    if (kban & na_ban):
+                                        continue
+                                    if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
+                                            and kdt[3] >= a3 and kdt[4] >= a4 and kdt[5] >= a5):
+                                        if not (ktb < a_tb and kdt == adt):
+                                            return True
+                            else:
+                                for kdt, _kban, ktb in bitems:
+                                    if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
+                                            and kdt[3] >= a3 and kdt[4] >= a4 and kdt[5] >= a5):
+                                        if not (ktb < a_tb and kdt == adt):
+                                            return True
+                    return False
+            elif _PLEN == 2:
+                def _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, adt, a_ban, a_sz, a_tb):
+                    a0, a1 = adt
+                    a_nonterm = (a_sz < K)
+                    hi_sz = K if not a_nonterm else a_sz
+                    na_ban = ~a_ban
+                    for sz in range(hi_sz + 1):
+                        gm = gmax_sz[sz]
+                        if gm is None or (a_nonterm and (sz_ban_and[sz] & na_ban)):
+                            continue
+                        if a0 > gm[0] or a1 > gm[1]:
+                            continue
+                        for bm, bba, bitems in blocks_sz[sz]:
+                            if (a_nonterm and (bba & na_ban)) or bm[0] < a0 or bm[1] < a1:
+                                continue
+                            if a_nonterm:
+                                for kdt, kban, ktb in bitems:
+                                    if (kban & na_ban):
+                                        continue
+                                    if kdt[0] >= a0 and kdt[1] >= a1:
+                                        if not (ktb < a_tb and kdt == adt):
+                                            return True
+                            else:
+                                for kdt, _kban, ktb in bitems:
+                                    if kdt[0] >= a0 and kdt[1] >= a1:
+                                        if not (ktb < a_tb and kdt == adt):
+                                            return True
+                    return False
+            elif _PLEN == 1:
+                def _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, adt, a_ban, a_sz, a_tb):
+                    a0 = adt[0]
+                    a_nonterm = (a_sz < K)
+                    hi_sz = K if not a_nonterm else a_sz
+                    na_ban = ~a_ban
+                    for sz in range(hi_sz + 1):
+                        gm = gmax_sz[sz]
+                        if gm is None or (a_nonterm and (sz_ban_and[sz] & na_ban)) or a0 > gm[0]:
+                            continue
+                        for bm, bba, bitems in blocks_sz[sz]:
+                            if (a_nonterm and (bba & na_ban)) or bm[0] < a0:
+                                continue
+                            if a_nonterm:
+                                for kdt, kban, ktb in bitems:
+                                    if (kban & na_ban):
+                                        continue
+                                    if kdt[0] >= a0 and not (ktb < a_tb and kdt == adt):
+                                        return True
+                            else:
+                                for kdt, _kban, ktb in bitems:
+                                    if kdt[0] >= a0 and not (ktb < a_tb and kdt == adt):
+                                        return True
+                    return False
+            elif _PLEN == 7:
+                def _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, adt, a_ban, a_sz, a_tb):
+                    a0, a1, a2, a3, a4, a5, a6 = adt
+                    a_nonterm = (a_sz < K)
+                    hi_sz = K if not a_nonterm else a_sz
+                    na_ban = ~a_ban
+                    for sz in range(hi_sz + 1):
+                        gm = gmax_sz[sz]
+                        if gm is None or (a_nonterm and (sz_ban_and[sz] & na_ban)):
+                            continue
+                        if (a0 > gm[0] or a1 > gm[1] or a2 > gm[2]
+                                or a3 > gm[3] or a4 > gm[4] or a5 > gm[5] or a6 > gm[6]):
+                            continue
+                        for bm, bba, bitems in blocks_sz[sz]:
+                            if ((a_nonterm and (bba & na_ban)) or bm[0] < a0 or bm[1] < a1
+                                    or bm[2] < a2 or bm[3] < a3 or bm[4] < a4 or bm[5] < a5
+                                    or bm[6] < a6):
+                                continue
+                            if a_nonterm:
+                                for kdt, kban, ktb in bitems:
+                                    if (kban & na_ban):
+                                        continue
+                                    if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
+                                            and kdt[3] >= a3 and kdt[4] >= a4 and kdt[5] >= a5
+                                            and kdt[6] >= a6):
+                                        if not (ktb < a_tb and kdt == adt):
+                                            return True
+                            else:
+                                for kdt, _kban, ktb in bitems:
+                                    if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
+                                            and kdt[3] >= a3 and kdt[4] >= a4 and kdt[5] >= a5
+                                            and kdt[6] >= a6):
+                                        if not (ktb < a_tb and kdt == adt):
+                                            return True
+                    return False
             elif _PLEN == 8:
-                def _is_dom_pool(gmax_sz, blocks_sz, adt, a_ban, a_sz, a_tb):
+                def _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, adt, a_ban, a_sz, a_tb):
                     a0, a1, a2, a3, a4, a5, a6, a7 = adt
                     a_nonterm = (a_sz < K)
                     hi_sz = K if not a_nonterm else a_sz
+                    na_ban = ~a_ban
                     for sz in range(hi_sz + 1):
                         gm = gmax_sz[sz]
-                        if (gm is None or a0 > gm[0] or a1 > gm[1] or a2 > gm[2]
+                        if gm is None or (a_nonterm and (sz_ban_and[sz] & na_ban)):
+                            continue
+                        if (a0 > gm[0] or a1 > gm[1] or a2 > gm[2]
                                 or a3 > gm[3] or a4 > gm[4] or a5 > gm[5]
                                 or a6 > gm[6] or a7 > gm[7]):
                             continue
-                        for bm, bitems in blocks_sz[sz]:
-                            if (bm[0] < a0 or bm[1] < a1 or bm[2] < a2
-                                    or bm[3] < a3 or bm[4] < a4 or bm[5] < a5
+                        for bm, bba, bitems in blocks_sz[sz]:
+                            if ((a_nonterm and (bba & na_ban)) or bm[0] < a0 or bm[1] < a1
+                                    or bm[2] < a2 or bm[3] < a3 or bm[4] < a4 or bm[5] < a5
                                     or bm[6] < a6 or bm[7] < a7):
                                 continue
                             if a_nonterm:
                                 for kdt, kban, ktb in bitems:
-                                    if (kban & ~a_ban):
+                                    if (kban & na_ban):
                                         continue
                                     if (kdt[0] >= a0 and kdt[1] >= a1 and kdt[2] >= a2
                                             and kdt[3] >= a3 and kdt[4] >= a4 and kdt[5] >= a5
@@ -2494,34 +3331,57 @@ class ExactGearsetOptimizer:
                                             return True
                     return False
             else:
-                rng_p = range(_PLEN)
-                def _is_dom_pool(gmax_sz, blocks_sz, adt, a_ban, a_sz, a_tb):
+                def _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, adt, a_ban, a_sz, a_tb):
                     a_nonterm = (a_sz < K)
                     hi_sz = K if not a_nonterm else a_sz
+                    na_ban = ~a_ban
                     for sz in range(hi_sz + 1):
                         gm = gmax_sz[sz]
-                        if gm is None or any(adt[j] > gm[j] for j in rng_p):
+                        if gm is None or (a_nonterm and (sz_ban_and[sz] & na_ban)):
                             continue
-                        for bm, bitems in blocks_sz[sz]:
-                            if any(bm[j] < adt[j] for j in rng_p):
+                        skip_g = False
+                        for j in rng_p:
+                            if adt[j] > gm[j]:
+                                skip_g = True
+                                break
+                        if skip_g:
+                            continue
+                        for bm, bba, bitems in blocks_sz[sz]:
+                            if a_nonterm and (bba & na_ban):
+                                continue
+                            skip_b = False
+                            for j in rng_p:
+                                if bm[j] < adt[j]:
+                                    skip_b = True
+                                    break
+                            if skip_b:
                                 continue
                             for kdt, kban, ktb in bitems:
-                                if a_nonterm and (kban & ~a_ban):
+                                if a_nonterm and (kban & na_ban):
                                     continue
-                                if all(kdt[j] >= adt[j] for j in rng_p):
-                                    if not (ktb < a_tb and kdt == adt):
-                                        return True
+                                dom = True
+                                for j in rng_p:
+                                    if kdt[j] < adt[j]:
+                                        dom = False
+                                        break
+                                if dom and not (ktb < a_tb and kdt == adt):
+                                    return True
                     return False
 
             def _dt_ge_tail(da, db):
-                for j in range(_PLEN):
+                for j in rng_p:
                     if da[j] < db[j]:
                         return False
                 return True
 
             def _prune_pool(sts):
+                gmax_sz = [None] * (K + 1)
+                blocks_sz = [[] for _ in range(K + 1)]
+                sz_ban_and = [0] * (K + 1)
                 if len(sts) <= 1:
-                    return sts
+                    if sts:
+                        _add_pool_idx(gmax_sz, blocks_sz, sz_ban_and, sts[0])
+                    return sts, gmax_sz, blocks_sz, sz_ban_and
                 by_key = {}
                 for s in sts:
                     key = (s[0], s[1], s[2])
@@ -2529,15 +3389,16 @@ class ExactGearsetOptimizer:
                     if prev is None or s[6] > prev[6]:
                         by_key[key] = s
                 if len(by_key) <= 1:
-                    return list(by_key.values())
+                    out = list(by_key.values())
+                    if out:
+                        _add_pool_idx(gmax_sz, blocks_sz, sz_ban_and, out[0])
+                    return out, gmax_sz, blocks_sz, sz_ban_and
                 sts = list(by_key.values())
                 sts.sort(key=lambda s: (-s[7], s[2], -s[6]))
                 kept = []
-                gmax_sz = [None] * (K + 1)
-                blocks_sz = [[] for _ in range(K + 1)]
                 for s in sts:
                     sdt = s[0]; s_ban = s[1]; s_sz = s[2]; s_tb = s[6]; s_sum = s[7]
-                    if _is_dom_pool(gmax_sz, blocks_sz, sdt, s_ban, s_sz, s_tb):
+                    if _is_dom_pool(gmax_sz, blocks_sz, sz_ban_and, sdt, s_ban, s_sz, s_tb):
                         continue
                     if kept and kept[-1][7] <= s_sum + 1e-9:
                         thr = s_sum + 1e-9
@@ -2552,10 +3413,10 @@ class ExactGearsetOptimizer:
                                     del kept[p]
                             p -= 1
                     kept.append(s)
-                    _add_pool_idx(gmax_sz, blocks_sz, s)
-                return kept
+                    _add_pool_idx(gmax_sz, blocks_sz, sz_ban_and, s)
+                return kept, gmax_sz, blocks_sz, sz_ban_and
 
-            def _merge_pool(fr_list, add_list):
+            def _merge_pool(fr_list, fr_gmax, fr_blocks, fr_sz_ban, add_list):
                 by_key = {}
                 for s in add_list:
                     key = (s[0], s[1], s[2])
@@ -2565,19 +3426,15 @@ class ExactGearsetOptimizer:
                 add_list = list(by_key.values())
                 add_list.sort(key=lambda s: (-s[7], s[2], -s[6]))
 
-                fr_gmax = [None] * (K + 1)
-                fr_blocks = [[] for _ in range(K + 1)]
-                for k in fr_list:
-                    _add_pool_idx(fr_gmax, fr_blocks, k)
-
                 surv = []
                 surv_gmax = [None] * (K + 1)
                 surv_blocks = [[] for _ in range(K + 1)]
+                surv_sz_ban = [0] * (K + 1)
                 for a in add_list:
                     adt = a[0]; a_ban = a[1]; a_sz = a[2]; a_tb = a[6]; a_sum = a[7]
-                    if _is_dom_pool(fr_gmax, fr_blocks, adt, a_ban, a_sz, a_tb):
+                    if _is_dom_pool(fr_gmax, fr_blocks, fr_sz_ban, adt, a_ban, a_sz, a_tb):
                         continue
-                    if _is_dom_pool(surv_gmax, surv_blocks, adt, a_ban, a_sz, a_tb):
+                    if _is_dom_pool(surv_gmax, surv_blocks, surv_sz_ban, adt, a_ban, a_sz, a_tb):
                         continue
                     if surv and surv[-1][7] <= a_sum + 1e-9:
                         thr = a_sum + 1e-9
@@ -2592,20 +3449,34 @@ class ExactGearsetOptimizer:
                                     del surv[p]
                             p -= 1
                     surv.append(a)
-                    _add_pool_idx(surv_gmax, surv_blocks, a)
+                    _add_pool_idx(surv_gmax, surv_blocks, surv_sz_ban, a)
                 if not surv:
-                    return fr_list
+                    return fr_list, fr_gmax, fr_blocks, fr_sz_ban
                 kept_fr = [s for s in fr_list
-                           if not _is_dom_pool(surv_gmax, surv_blocks, s[0], s[1], s[2], s[6])]
+                           if not _is_dom_pool(surv_gmax, surv_blocks, surv_sz_ban, s[0], s[1], s[2], s[6])]
+                if len(kept_fr) == len(fr_list):
+                    # Zero existing items removed -> incrementally update index!
+                    fr_list.extend(surv)
+                    for a in surv:
+                        _add_pool_idx(fr_gmax, fr_blocks, fr_sz_ban, a)
+                    return fr_list, fr_gmax, fr_blocks, fr_sz_ban
                 kept_fr.extend(surv)
-                kept_fr.sort(key=lambda s: (-s[7], s[2], -s[6]))
-                return kept_fr
+                new_gmax = [None] * (K + 1)
+                new_blocks = [[] for _ in range(K + 1)]
+                new_sz_ban = [0] * (K + 1)
+                for s in kept_fr:
+                    _add_pool_idx(new_gmax, new_blocks, new_sz_ban, s)
+                return kept_fr, new_gmax, new_blocks, new_sz_ban
 
             import time as _pt
             z_v = (0.0,) * nax
             z_kw = (0,) * nrk
             z_dt, z_sum = _make_dt(z_v, z_kw)
             fr = [(z_dt, 0, 0, z_v, z_kw, (), 0.0, z_sum)]
+            fr_gmax = [None] * (K + 1)
+            fr_blocks = [[] for _ in range(K + 1)]
+            fr_sz_ban = [0] * (K + 1)
+            _add_pool_idx(fr_gmax, fr_blocks, fr_sz_ban, fr[0])
             _gen = 0; _peak = 1; _t0 = _pt.perf_counter()
             live_prev = acc_m
             for idx, it in enumerate(ord_items):
@@ -2638,9 +3509,9 @@ class ExactGearsetOptimizer:
                     fr = [(s[0], s[1] & fmask, s[2], s[3], s[4], s[5], s[6], s[7]) for s in fr]
                     if add:
                         fr.extend(add)
-                    fr = _prune_pool(fr)
+                    fr, fr_gmax, fr_blocks, fr_sz_ban = _prune_pool(fr)
                 elif add:
-                    fr = _merge_pool(fr, add)
+                    fr, fr_gmax, fr_blocks, fr_sz_ban = _merge_pool(fr, fr_gmax, fr_blocks, fr_sz_ban, add)
                 live_prev = fmask
                 if len(fr) > _peak:
                     _peak = len(fr)
@@ -2890,7 +3761,8 @@ class ExactGearsetOptimizer:
             _tfkey = (skill, str(location), int(n_tools),
                       tuple(sorted((it.id, it.qty) for it in _tool_its)),
                       frozenset(reqs.items()),
-                      tuple(self.MAX_AXES), tuple(self.MIN_AXES),
+                      tuple(self.AXES), tuple(self.MAX_AXES), tuple(self.MIN_AXES),
+                      self._mitm_cache_extra_key(),
                       tuple(sorted((a, round(float(h), 6)) for a, h in _HV.items())))
             _cached = _tfc.get(_tfkey)
         if _cached is not None:
