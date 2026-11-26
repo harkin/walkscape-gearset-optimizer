@@ -449,7 +449,7 @@ def exact_craft_steps_optimize(recipe, character, *, skill, location,
                                has_equipment_input, apply_quality,
                                pets=None, consumables=None, node_budget=None,
                                service=None, base_stats_extra=None, fast=False,
-                               tool_frontier_cache=None):
+                               tool_frontier_cache=None, mitm_cache=None):
     """Return {slot: Item|None} for a recipe node (the exact steps-to-output
     gearset), or None on failure. The caller computes the authoritative
     total_steps_per_output by re-running the tree's own calculate_node_metrics
@@ -507,7 +507,8 @@ def exact_craft_steps_optimize(recipe, character, *, skill, location,
     _t0 = _time.perf_counter()
     result = opt.optimize(adapter, character, skill=skill, location=location,
                           base_stats=base_stats, pets=pets, consumables=consumables,
-                          tool_frontier_cache=tool_frontier_cache)
+                          tool_frontier_cache=tool_frontier_cache,
+                          mitm_cache=mitm_cache)
     _dt_ms = (_time.perf_counter() - _t0) * 1000.0
     # Per-solve diagnostic (fc-preopt). ONE concise line per gear B&B solve —
     # low volume (~16/item), greppable as [FC-BNB], and captured by the

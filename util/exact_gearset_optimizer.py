@@ -677,51 +677,247 @@ class ExactGearsetOptimizer:
 
     @staticmethod
     def _sfs_prune_tuples(items):
-        """Sort-Filter-Skyline exact Pareto prune on tuples:
-            (dt, v_tup, kw_tup, comp, tb, dt_sum)
-        where higher is better on every coordinate of `dt`. Tie-breaks on exact
-        `dt` equality by higher `tb`, then shorter `comp`."""
-        if len(items) <= 1:
+        """Ultra-fast exact Pareto prune on tuples whose indices 0, 3, 4, 5 are
+        (dt, ..., comp, tb, dt_sum), where higher is better on every coordinate
+        of `dt`. Combines:
+          1. O(1) exact-`dt` dict deduplication (keeping best (tb, -len(comp))).
+          2. Sort-Filter-Skyline descending by `dt_sum`.
+          3. Global `gmax` O(1) instant-accept + 64-element bounding-box blocks
+             with unrolled dominance checks for dlen 4..8.
+          4. O(1) tail-only reverse dominance check (eliminating O(|kept|^2)
+             list copying)."""
+        n = len(items)
+        if n <= 1:
             return items
-        dlen = len(items[0][0])
-        items.sort(key=lambda s: (-s[5], -s[4], len(s[3])))
-        kept = []
+
+        # Step 1: O(1) exact-dt deduplication -> all survivors have distinct dt
+        by_dt = {}
         for s in items:
-            sdt = s[0]
-            s_tb = s[4]
-            s_sum = s[5]
-            dominated = False
-            for k in kept:
-                kdt = k[0]
+            dt = s[0]
+            prev = by_dt.get(dt)
+            if prev is None:
+                by_dt[dt] = s
+            else:
+                if s[4] > prev[4] or (s[4] == prev[4] and len(s[3]) < len(prev[3])):
+                    by_dt[dt] = s
+        if len(by_dt) <= 1:
+            return list(by_dt.values())
+
+        uniq = list(by_dt.values())
+        uniq.sort(key=lambda s: s[5], reverse=True)
+        dlen = len(uniq[0][0])
+
+        first = uniq[0]
+        fdt = first[0]
+        kept = [first]
+        gmax = list(fdt)
+        # Each block is [bmax_list, list_of_kdt]
+        blocks = [[list(fdt), [fdt]]]
+
+        def _tail_remove(s_dt, s_sum):
+            thr = s_sum + 1e-9
+            p = len(kept) - 1
+            while p >= 0 and kept[p][5] <= thr:
+                kdt = kept[p][0]
                 dom = True
                 for j in range(dlen):
-                    if kdt[j] < sdt[j]:
+                    if s_dt[j] < kdt[j]:
                         dom = False
                         break
                 if dom:
-                    if k[4] < s_tb and kdt == sdt:
-                        continue
-                    dominated = True
-                    break
-            if dominated:
-                continue
-            # Only earlier kept entries with k_sum <= s_sum + 1e-9 could possibly
-            # be dominated by s (due to float sum rounding).
-            thr = s_sum + 1e-9
-            new_kept = []
-            for k in kept:
-                if k[5] <= thr:
-                    kdt = k[0]
-                    dom = True
-                    for j in range(dlen):
-                        if sdt[j] < kdt[j]:
-                            dom = False
+                    del kept[p]
+                    # Remove kdt from its block (searching from the end)
+                    for bi in range(len(blocks) - 1, -1, -1):
+                        bdts = blocks[bi][1]
+                        try:
+                            bdts.remove(kdt)
+                            if not bdts:
+                                del blocks[bi]
+                            else:
+                                bm = list(bdts[0])
+                                for xdt in bdts[1:]:
+                                    for j in range(dlen):
+                                        if xdt[j] > bm[j]:
+                                            bm[j] = xdt[j]
+                                blocks[bi][0] = bm
                             break
-                    if dom and not (s_tb < k[4] and sdt == kdt):
-                        continue
-                new_kept.append(k)
-            new_kept.append(s)
-            kept = new_kept
+                        except ValueError:
+                            continue
+                p -= 1
+
+        def _add_to_blocks(s_dt):
+            if not blocks or len(blocks[-1][1]) >= 64:
+                blocks.append([list(s_dt), [s_dt]])
+            else:
+                blk = blocks[-1]
+                bm = blk[0]
+                for j in range(dlen):
+                    if s_dt[j] > bm[j]:
+                        bm[j] = s_dt[j]
+                blk[1].append(s_dt)
+            for j in range(dlen):
+                if s_dt[j] > gmax[j]:
+                    gmax[j] = s_dt[j]
+
+        if dlen == 6:
+            for s in uniq[1:]:
+                sdt = s[0]
+                s0, s1, s2, s3, s4, s5 = sdt
+                dominated = False
+                if (s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]
+                        and s3 <= gmax[3] and s4 <= gmax[4] and s5 <= gmax[5]):
+                    for bm, bdts in blocks:
+                        if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
+                                or bm[3] < s3 or bm[4] < s4 or bm[5] < s5):
+                            continue
+                        for kdt in bdts:
+                            if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
+                                    and kdt[3] >= s3 and kdt[4] >= s4 and kdt[5] >= s5):
+                                dominated = True
+                                break
+                        if dominated:
+                            break
+                if dominated:
+                    continue
+                if kept and kept[-1][5] <= s[5] + 1e-9:
+                    _tail_remove(sdt, s[5])
+                kept.append(s)
+                _add_to_blocks(sdt)
+        elif dlen == 7:
+            for s in uniq[1:]:
+                sdt = s[0]
+                s0, s1, s2, s3, s4, s5, s6 = sdt
+                dominated = False
+                if (s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]
+                        and s3 <= gmax[3] and s4 <= gmax[4] and s5 <= gmax[5]
+                        and s6 <= gmax[6]):
+                    for bm, bdts in blocks:
+                        if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
+                                or bm[3] < s3 or bm[4] < s4 or bm[5] < s5
+                                or bm[6] < s6):
+                            continue
+                        for kdt in bdts:
+                            if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
+                                    and kdt[3] >= s3 and kdt[4] >= s4 and kdt[5] >= s5
+                                    and kdt[6] >= s6):
+                                dominated = True
+                                break
+                        if dominated:
+                            break
+                if dominated:
+                    continue
+                if kept and kept[-1][5] <= s[5] + 1e-9:
+                    _tail_remove(sdt, s[5])
+                kept.append(s)
+                _add_to_blocks(sdt)
+        elif dlen == 8:
+            for s in uniq[1:]:
+                sdt = s[0]
+                s0, s1, s2, s3, s4, s5, s6, s7 = sdt
+                dominated = False
+                if (s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]
+                        and s3 <= gmax[3] and s4 <= gmax[4] and s5 <= gmax[5]
+                        and s6 <= gmax[6] and s7 <= gmax[7]):
+                    for bm, bdts in blocks:
+                        if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
+                                or bm[3] < s3 or bm[4] < s4 or bm[5] < s5
+                                or bm[6] < s6 or bm[7] < s7):
+                            continue
+                        for kdt in bdts:
+                            if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
+                                    and kdt[3] >= s3 and kdt[4] >= s4 and kdt[5] >= s5
+                                    and kdt[6] >= s6 and kdt[7] >= s7):
+                                dominated = True
+                                break
+                        if dominated:
+                            break
+                if dominated:
+                    continue
+                if kept and kept[-1][5] <= s[5] + 1e-9:
+                    _tail_remove(sdt, s[5])
+                kept.append(s)
+                _add_to_blocks(sdt)
+        elif dlen == 5:
+            for s in uniq[1:]:
+                sdt = s[0]
+                s0, s1, s2, s3, s4 = sdt
+                dominated = False
+                if (s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2]
+                        and s3 <= gmax[3] and s4 <= gmax[4]):
+                    for bm, bdts in blocks:
+                        if (bm[0] < s0 or bm[1] < s1 or bm[2] < s2
+                                or bm[3] < s3 or bm[4] < s4):
+                            continue
+                        for kdt in bdts:
+                            if (kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2
+                                    and kdt[3] >= s3 and kdt[4] >= s4):
+                                dominated = True
+                                break
+                        if dominated:
+                            break
+                if dominated:
+                    continue
+                if kept and kept[-1][5] <= s[5] + 1e-9:
+                    _tail_remove(sdt, s[5])
+                kept.append(s)
+                _add_to_blocks(sdt)
+        elif dlen == 4:
+            for s in uniq[1:]:
+                sdt = s[0]
+                s0, s1, s2, s3 = sdt
+                dominated = False
+                if s0 <= gmax[0] and s1 <= gmax[1] and s2 <= gmax[2] and s3 <= gmax[3]:
+                    for bm, bdts in blocks:
+                        if bm[0] < s0 or bm[1] < s1 or bm[2] < s2 or bm[3] < s3:
+                            continue
+                        for kdt in bdts:
+                            if kdt[0] >= s0 and kdt[1] >= s1 and kdt[2] >= s2 and kdt[3] >= s3:
+                                dominated = True
+                                break
+                        if dominated:
+                            break
+                if dominated:
+                    continue
+                if kept and kept[-1][5] <= s[5] + 1e-9:
+                    _tail_remove(sdt, s[5])
+                kept.append(s)
+                _add_to_blocks(sdt)
+        else:
+            rng_d = range(dlen)
+            for s in uniq[1:]:
+                sdt = s[0]
+                dominated = False
+                can_dom = True
+                for j in rng_d:
+                    if sdt[j] > gmax[j]:
+                        can_dom = False
+                        break
+                if can_dom:
+                    for bm, bdts in blocks:
+                        skip = False
+                        for j in rng_d:
+                            if bm[j] < sdt[j]:
+                                skip = True
+                                break
+                        if skip:
+                            continue
+                        for kdt in bdts:
+                            dom = True
+                            for j in rng_d:
+                                if kdt[j] < sdt[j]:
+                                    dom = False
+                                    break
+                            if dom:
+                                dominated = True
+                                break
+                        if dominated:
+                            break
+                if dominated:
+                    continue
+                if kept and kept[-1][5] <= s[5] + 1e-9:
+                    _tail_remove(sdt, s[5])
+                kept.append(s)
+                _add_to_blocks(sdt)
         return kept
 
     @staticmethod
@@ -791,12 +987,11 @@ class ExactGearsetOptimizer:
         blocks.sort(key=lambda b: b[0], reverse=True)
         return [(b[1], b[2], b[3]) for b in blocks]
 
-    def _group_collapse(self, slot_defs, metas=(), reqs=None, headroom=None):
+    def _group_collapse(self, slot_defs, metas=(), reqs=None, headroom=None, min_req=None):
         """Collapse a set of slots into their Pareto frontier of partial
-        gearsets. Uses flat tuples + SFS (Sort-Filter-Skyline) dominance,
-        optional saturation-headroom caps, and a final (mask, used)-free prune
-        once all slots in the group are assigned (exact because groups have
-        disjoint slots and item pools)."""
+        gearsets. Uses flat tuples + blocked SFS dominance, optional saturation-
+        headroom caps, group-local active keyword dimensions, suffix keyword-
+        infeasibility pruning, and a final (mask, used)-free prune."""
         from collections import defaultdict
         AXES = self.AXES
         nax = len(AXES)
@@ -819,87 +1014,14 @@ class ExactGearsetOptimizer:
                                   if c > 1 and qty_of.get(i, 1) < c))
 
         metas_at = [[] for _ in range(n)]
+        meta_idxs = {}
         for m in metas:
             idxs = sorted(idx_of[s] for s in m.slots)
             mask = 0
             for i in idxs:
                 mask |= (1 << i)
             metas_at[idxs[0]].append((m, mask))
-
-        max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
-        min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
-        hv = headroom or {}
-        max_caps = tuple(hv.get(a, None) for a in self.MAX_AXES)
-        has_caps = any(c is not None for c in max_caps)
-        dlen = len(max_idxs) + len(min_idxs) + nrk
-
-        def _make_dt(vt, kwt):
-            if has_caps:
-                dt = (tuple(vt[ax] if cap is None or vt[ax] <= cap else cap
-                            for ax, cap in zip(max_idxs, max_caps))
-                      + tuple(-vt[ax] for ax in min_idxs)
-                      + kwt)
-            else:
-                dt = (tuple(vt[ax] for ax in max_idxs)
-                      + tuple(-vt[ax] for ax in min_idxs)
-                      + kwt)
-            return dt, sum(dt)
-
-        def _prune_grouped(sts):
-            groups = defaultdict(list)
-            for s in sts:
-                # s = (dt, vt, kwt, comp, tb, dt_sum, used, mask)
-                gk = (s[7], tuple(s[6].get(i, 0) for i in shared_ids)) if shared_ids else s[7]
-                groups[gk].append(s)
-            out = []
-            for g in groups.values():
-                if len(g) <= 1:
-                    out.extend(g)
-                    continue
-                g.sort(key=lambda s: (-s[5], -s[4], len(s[3])))
-                kept = []
-                for s in g:
-                    sdt = s[0]; s_tb = s[4]; s_sum = s[5]
-                    dominated = False
-                    for k in kept:
-                        kdt = k[0]
-                        dom = True
-                        for j in range(dlen):
-                            if kdt[j] < sdt[j]:
-                                dom = False
-                                break
-                        if dom:
-                            if k[4] < s_tb and kdt == sdt:
-                                continue
-                            dominated = True
-                            break
-                    if dominated:
-                        continue
-                    thr = s_sum + 1e-9
-                    new_kept = []
-                    for k in kept:
-                        if k[5] <= thr:
-                            kdt = k[0]
-                            dom = True
-                            for j in range(dlen):
-                                if sdt[j] < kdt[j]:
-                                    dom = False
-                                    break
-                            if dom and not (s_tb < k[4] and sdt == kdt):
-                                continue
-                        new_kept.append(k)
-                    new_kept.append(s)
-                    kept = new_kept
-                out.extend(kept)
-            return out
-
-        def _uinc(used, ids):
-            if not shared_ids and not metas:
-                return used
-            nu = dict(used)
-            for c in ids:
-                nu[c] = nu.get(c, 0) + 1
-            return nu
+            meta_idxs[m.id] = idxs
 
         # Pre-extract candidate vectors
         cands_prep = [
@@ -915,6 +1037,77 @@ class ExactGearsetOptimizer:
             for ms in metas_at
         ]
 
+        # Suffix upper bound on keyword supply for slots > i (exact conservative
+        # bound: slot_max + max meta excess at each slot). Also detect which req
+        # keywords are actually supplied by this group (omit constant-0 keywords
+        # from `dt` to reduce skyline dimensionality!).
+        min_req_t = tuple(min_req.get(k, 0) for k in rk) if (min_req and nrk) else ((0,) * nrk)
+        rem_kw = [[0] * nrk for _ in range(n + 1)]
+        if nrk:
+            slot_kw_max = [[max([itkw[j] for _, _, itkw in cands_prep[i]] + [0]) for j in range(nrk)]
+                           for i in range(n)]
+            for i in range(n - 1, -1, -1):
+                for j in range(nrk):
+                    ex = 0
+                    for m, _, _, mkw in metas_prep[i]:
+                        d = mkw[j] - sum(slot_kw_max[u][j] for u in meta_idxs[m.id])
+                        if d > ex:
+                            ex = d
+                    rem_kw[i][j] = rem_kw[i + 1][j] + slot_kw_max[i][j] + ex
+            # Early exit if this group cannot even meet its minimum keyword obligation
+            for j in range(nrk):
+                if rem_kw[0][j] < min_req_t[j]:
+                    return []
+            active_kw_idxs = tuple(j for j in range(nrk) if rem_kw[0][j] > 0)
+        else:
+            active_kw_idxs = ()
+        has_min_req = any(x > 0 for x in min_req_t)
+
+        max_idxs = tuple(AXES.index(a) for a in self.MAX_AXES)
+        min_idxs = tuple(AXES.index(a) for a in self.MIN_AXES)
+        hv = headroom or {}
+        max_caps = tuple(hv.get(a, None) for a in self.MAX_AXES)
+        has_caps = any(c is not None for c in max_caps)
+        n_akw = len(active_kw_idxs)
+
+        def _make_dt(vt, kwt):
+            if has_caps:
+                t_max = tuple(vt[ax] if cap is None or vt[ax] <= cap else cap
+                              for ax, cap in zip(max_idxs, max_caps))
+            else:
+                t_max = tuple(vt[ax] for ax in max_idxs)
+            t_min = tuple(-vt[ax] for ax in min_idxs)
+            if n_akw:
+                dt = t_max + t_min + tuple(kwt[j] for j in active_kw_idxs)
+            else:
+                dt = t_max + t_min
+            return dt, sum(dt)
+
+        _prune_sfs = self._sfs_prune_tuples
+
+        def _prune_grouped(sts):
+            if not shared_ids and not metas:
+                return _prune_sfs(sts)
+            groups = defaultdict(list)
+            for s in sts:
+                gk = (s[7], tuple(s[6].get(i, 0) for i in shared_ids)) if shared_ids else s[7]
+                groups[gk].append(s)
+            out = []
+            for g in groups.values():
+                if len(g) <= 1:
+                    out.extend(g)
+                else:
+                    out.extend(_prune_sfs(g))
+            return out
+
+        def _uinc(used, ids):
+            if not shared_ids and not metas:
+                return used
+            nu = dict(used)
+            for c in ids:
+                nu[c] = nu.get(c, 0) + 1
+            return nu
+
         z_v = (0.0,) * nax
         z_kw = (0,) * nrk
         z_dt, z_sum = _make_dt(z_v, z_kw)
@@ -928,22 +1121,34 @@ class ExactGearsetOptimizer:
             bit = 1 << i
             cp = cands_prep[i]
             mp = metas_prep[i]
+            rem_after = rem_kw[i + 1] if has_min_req else None
             if not cp and not mp:
+                if has_min_req:
+                    states = [st for st in states
+                              if all(st[2][j] + rem_after[j] >= min_req_t[j] for j in rng_rk)]
                 continue
             nxt = []
             for st in states:
                 mask = st[7]
+                skw = st[2]
                 if mask & bit:
-                    nxt.append(st)
+                    if not has_min_req or all(skw[j] + rem_after[j] >= min_req_t[j] for j in rng_rk):
+                        nxt.append(st)
                     continue
-                nxt.append(st)
-                sv, skw, scomp, stb, sused = st[1], st[2], st[3], st[4], st[6]
+                # Empty choice for slot i (skip immediately if remaining slots can't meet min_req)
+                if not has_min_req or all(skw[j] + rem_after[j] >= min_req_t[j] for j in rng_rk):
+                    nxt.append(st)
+                sv, scomp, stb, sused = st[1], st[3], st[4], st[6]
                 for it, itv, itkw in cp:
                     if need_used and sused.get(it.id, 0) >= it.qty:
                         continue
+                    if nrk:
+                        nkw = tuple(min(skw[j] + itkw[j], req_caps[j]) for j in rng_rk)
+                        if has_min_req and any(nkw[j] + rem_after[j] < min_req_t[j] for j in rng_rk):
+                            continue
+                    else:
+                        nkw = z_kw
                     nv = tuple(sv[j] + itv[j] for j in rng_ax)
-                    nkw = (tuple(min(skw[j] + itkw[j], req_caps[j]) for j in rng_rk)
-                           if nrk else z_kw)
                     ndt, nsum = _make_dt(nv, nkw)
                     nu = _uinc(sused, (it.id,)) if need_used else sused
                     nxt.append((ndt, nv, nkw, scomp + ((label, it.id),),
@@ -951,19 +1156,27 @@ class ExactGearsetOptimizer:
                 for m, mmask, mv, mkw in mp:
                     if (mask & mmask) or any(sused.get(c, 0) > 0 for c in m.component_ids):
                         continue
+                    if nrk:
+                        nkw = tuple(min(skw[j] + mkw[j], req_caps[j]) for j in rng_rk)
+                        if has_min_req and any(nkw[j] + rem_after[j] < min_req_t[j] for j in rng_rk):
+                            continue
+                    else:
+                        nkw = z_kw
                     nv = tuple(sv[j] + mv[j] for j in rng_ax)
-                    nkw = (tuple(min(skw[j] + mkw[j], req_caps[j]) for j in rng_rk)
-                           if nrk else z_kw)
                     ndt, nsum = _make_dt(nv, nkw)
                     nu = _uinc(sused, m.component_ids)
                     nxt.append((ndt, nv, nkw, scomp + (("+".join(m.slots), m.id),),
                                 stb + m.tb, nsum, nu, mask | mmask))
+            if not nxt:
+                return []
             states = _prune_grouped(nxt)
 
         # Final ungrouped Pareto prune: once all slots in this group are filled,
         # mask and used cannot affect any other (disjoint) group!
+        # If every surviving state has identical kw on an axis (e.g. min_req == req),
+        # _sfs_prune_tuples collapses automatically.
         final_tups = [(s[0], s[1], s[2], s[3], s[4], s[5]) for s in states]
-        final_tups = self._sfs_prune_tuples(final_tups)
+        final_tups = _prune_sfs(final_tups)
         return [
             {
                 "v": dict(zip(AXES, s[1])),
@@ -1062,9 +1275,42 @@ class ExactGearsetOptimizer:
         hr_t = self._compute_headroom(kappa, base_stats, WE_level, g_lists + r_lists, g_metas + r_metas) if use_hr else None
         hr_r = self._compute_headroom(kappa, base_stats, WE_level, g_lists + t_lists, g_metas + t_metas) if use_hr else None
 
-        FG = self._group_collapse([(sl, slots.get(sl, [])) for sl in g_slots], g_metas, reqs, headroom=hr_g)
-        FT = self._group_collapse([(sl, slots.get(sl, [])) for sl in t_slots], t_metas, reqs, headroom=hr_t)
-        FR = self._group_collapse([(sl, slots.get(sl, [])) for sl in r_slots], r_metas, reqs, headroom=hr_r)
+        # Per-group max keyword supply upper bounds -> per-group minimum keyword
+        # obligations so _group_collapse drops infeasible branches early.
+        min_req_g = min_req_t = min_req_r = None
+        if reqs:
+            def _grp_max_kw(s_lists, g_ms):
+                out = {}
+                for k in reqs:
+                    tot = 0
+                    for lst in s_lists:
+                        tot += max([it.keywords.count(k) for it in lst] + [0])
+                    # Conservative meta excess
+                    for m in g_ms:
+                        mk = m.keywords.count(k)
+                        if mk > 0:
+                            tot += mk
+                    out[k] = tot
+                return out
+            mk_g = _grp_max_kw(g_lists, g_metas)
+            mk_t = _grp_max_kw(t_lists, t_metas)
+            mk_r = _grp_max_kw(r_lists, r_metas)
+            for k, need in reqs.items():
+                if mk_g[k] + mk_t[k] + mk_r[k] < need:
+                    return None
+            min_req_g = {k: max(0, reqs[k] - mk_t[k] - mk_r[k]) for k in reqs}
+            min_req_t = {k: max(0, reqs[k] - mk_g[k] - mk_r[k]) for k in reqs}
+            min_req_r = {k: max(0, reqs[k] - mk_g[k] - mk_t[k]) for k in reqs}
+
+        FG = self._group_collapse([(sl, slots.get(sl, [])) for sl in g_slots], g_metas, reqs, headroom=hr_g, min_req=min_req_g)
+        if not FG:
+            return None
+        FT = self._group_collapse([(sl, slots.get(sl, [])) for sl in t_slots], t_metas, reqs, headroom=hr_t, min_req=min_req_t)
+        if not FT:
+            return None
+        FR = self._group_collapse([(sl, slots.get(sl, [])) for sl in r_slots], r_metas, reqs, headroom=hr_r, min_req=min_req_r)
+        if not FR:
+            return None
 
         # Dynamic 2-way merge order: pick the pair with the smallest product!
         p_tr = len(FT) * len(FR)
@@ -1376,11 +1622,12 @@ class ExactGearsetOptimizer:
     # ── public entry ─────────────────────────────────────────────────────────
     def optimize(self, activity, character, skill=None, location=None, base_stats=None,
                  pets=None, consumables=None, input_item=None, frontier_cache=None,
-                 tool_frontier_cache=None):
+                 tool_frontier_cache=None, mitm_cache=None):
         """Return {slot: Item|None} for controlled slots, or None to fall back."""
         self.last_run_budget_exhausted = False
         self._frontier_cache = frontier_cache
         self._tool_frontier_cache = tool_frontier_cache
+        self._mitm_cache = mitm_cache
         try:
             return self._run(activity, character, skill, location, base_stats or {},
                              pets, consumables, input_item)
@@ -1460,6 +1707,40 @@ class ExactGearsetOptimizer:
                 _FAr = self._rescale_acoins(_FA, _f)
                 _base = self._build_base_axis(base_stats, character, skill, location, input_item)
                 _r, _load, _s = self._combine_best(_FGr, _FAr, reqs, X0, S0, kappa, WE_level, _base)
+                if _load is None:
+                    return None
+                return self._reconstruct_gearset(_load, _rs, _rm, _rp, _nt)
+
+        # ── generic MITM frontier cache fast-path (e.g. craft quality re-solves)
+        # Reuses (F1, F2, refs) across solves with identical pools, reqs, axes,
+        # kappa, WE_level, and base_axis (e.g. Good/Great/Excellent/Perfect/
+        # Eternal craft cells where only target_quality/m0/use_fine vary).
+        _mcache = getattr(self, "_mitm_cache", None)
+        _mkey = None
+        _base_pre = None
+        if (_mcache is not None and getattr(self, "_MITM_ENABLED", False)
+                and not getattr(self, "GREEDY_SEED_ONLY", False)
+                and not getattr(self, "_ESTIMATE_ONLY", False)):
+            _base_pre = self._build_base_axis(base_stats, character, skill, location, input_item)
+            _kwlr = tuple(sorted(
+                (str(r.get("keyword", "")).lower(), str(r.get("skill", "")).lower(), int(r.get("level", 0) or 0))
+                for r in ((getattr(activity, "requirements", {}) or {}).get("keyword_level_requirements") or [])
+            ))
+            _mkey = (
+                self._frontier_key(character, skill, location, reqs, pets, consumables),
+                int(n_tools),
+                tuple(self.AXES), tuple(self.MAX_AXES), tuple(self.MIN_AXES),
+                round(float(kappa), 8), round(float(WE_level), 8),
+                tuple((a, round(float(_base_pre.get(a, 0.0)), 8)) for a in AXES),
+                _kwlr,
+            )
+            _mhit = _mcache.get(_mkey)
+            if _mhit is not None:
+                _F1, _F2, _rs, _rm, _rp, _nt = _mhit
+                self._last_opt_nodes = 0
+                if _F1 is None:
+                    return None
+                _r, _load, _s = self._combine_best(_F1, _F2, reqs, X0, S0, kappa, WE_level, _base_pre)
                 if _load is None:
                     return None
                 return self._reconstruct_gearset(_load, _rs, _rm, _rp, _nt)
@@ -1654,10 +1935,11 @@ class ExactGearsetOptimizer:
                             break
                     if dominated:
                         continue
-                    thr = s_sum + 1e-9
-                    new_kept = []
-                    for k in kept:
-                        if k[7] <= thr:
+                    if kept and kept[-1][7] <= s_sum + 1e-9:
+                        thr = s_sum + 1e-9
+                        p = len(kept) - 1
+                        while p >= 0 and kept[p][7] <= thr:
+                            k = kept[p]
                             k_sz = k[2]
                             if not (k_sz < K and (s_sz > k_sz or (s_ban & ~k[1]))):
                                 kdt = k[0]
@@ -1667,10 +1949,9 @@ class ExactGearsetOptimizer:
                                         dom = False
                                         break
                                 if dom and not (s_tb < k[6] and sdt == kdt):
-                                    continue
-                        new_kept.append(k)
-                    new_kept.append(s)
-                    kept = new_kept
+                                    del kept[p]
+                            p -= 1
+                    kept.append(s)
                 return kept
 
             def _merge_pool(fr_list, add_list):
@@ -1720,10 +2001,11 @@ class ExactGearsetOptimizer:
                             break
                     if dominated:
                         continue
-                    thr = a_sum + 1e-9
-                    new_surv = []
-                    for k in surv:
-                        if k[7] <= thr:
+                    if surv and surv[-1][7] <= a_sum + 1e-9:
+                        thr = a_sum + 1e-9
+                        p = len(surv) - 1
+                        while p >= 0 and surv[p][7] <= thr:
+                            k = surv[p]
                             k_sz = k[2]
                             if not (k_sz < K and (a_sz > k_sz or (a_ban & ~k[1]))):
                                 kdt = k[0]
@@ -1733,10 +2015,9 @@ class ExactGearsetOptimizer:
                                         dom = False
                                         break
                                 if dom and not (a_tb < k[6] and adt == kdt):
-                                    continue
-                        new_surv.append(k)
-                    new_surv.append(a)
-                    surv = new_surv
+                                    del surv[p]
+                            p -= 1
+                    surv.append(a)
                 if not surv:
                     return fr_list
                 # Remove any state in fr_list dominated by a state in surv
@@ -2001,6 +2282,25 @@ class ExactGearsetOptimizer:
         _nontool_slot_lists = [slots[sl] for sl in self.SINGLE] + \
             [slots.get("ring1", []), slots.get("ring2", []),
              slots.get("pet", []), slots.get("consumable", [])]
+
+        # Early global keyword-feasibility check: if even the conservative upper
+        # bound across all non-tool slots + metas + top-n_tools tools cannot
+        # satisfy a required keyword count, bail immediately (skips pool_frontier
+        # and MITM builds on infeasible activities/services).
+        if reqs:
+            _nt_cap = int(n_tools)
+            for _rk, _rneed in reqs.items():
+                _max_sup = sum(max([it.keywords.count(_rk) for it in _lst] + [0])
+                               for _lst in _nontool_slot_lists)
+                for _m in metas:
+                    _max_sup += _m.keywords.count(_rk)
+                if _nt_cap > 0 and _tool_its:
+                    _tks = sorted((it.keywords.count(_rk) for it in _tool_its), reverse=True)
+                    _max_sup += sum(_tks[:_nt_cap])
+                if _max_sup < _rneed:
+                    if _mkey is not None:
+                        _mcache[_mkey] = (None, None, None, None, None, 0)
+                    return None
         _HV = {}
         for _ax, _cap in _sat_caps.items():
             if _cap is None:
@@ -2092,7 +2392,15 @@ class ExactGearsetOptimizer:
         elif _use_mitm:
             import time as _t
             _t0 = _t.perf_counter()
-            r_m, load_m, _sm = self._optimize_mitm(slots, metas, reqs, X0, S0, kappa, WE_level, base)
+            _fr_m = self._mitm_frontiers(slots, metas, reqs, kappa=kappa,
+                                         WE_level=WE_level, base_stats=base)
+            if _fr_m is not None:
+                _F1m, _FTm, _FRm, _F2m = _fr_m
+                if _mkey is not None:
+                    _mcache[_mkey] = (_F1m, _F2m, refs_single, refs_meta, refs_pool, n_tools)
+                r_m, load_m, _sm = self._combine_best(_F1m, _F2m, reqs, X0, S0, kappa, WE_level, base)
+            else:
+                r_m, load_m, _sm = float("-inf"), None, None
             _tm = (_t.perf_counter() - _t0) * 1000.0
             _validate = getattr(self, "_MITM_VALIDATE", True)
             if load_m is None:

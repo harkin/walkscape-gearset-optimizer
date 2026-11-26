@@ -969,6 +969,8 @@ def solve_item_all_qualities(output_ref: str, session_data: dict,
     if log is None:
         def log(*_a, **_k):
             pass
+    if leaf_memo is None:
+        leaf_memo = {}
     from ui.crafting_tree import build_crafting_tree, _load_game_data, descendant_ids
     from ui.crafting_tree_exact_driver import optimize_tree_exact, optimize_root_only
     gd = _load_game_data()

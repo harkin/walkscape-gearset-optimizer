@@ -931,7 +931,9 @@ def _solve_node(n, kids, cum, character, session_data, global_settings, tq,
                         pets=_p, consumables=_c, service=_svc_obj,
                         base_stats_extra=ov or None, fast=_fast,
                         tool_frontier_cache=(leaf_memo.setdefault('__tool_frontier_memo__', {})
-                                             if leaf_memo is not None else None))
+                                             if leaf_memo is not None else None),
+                        mitm_cache=(leaf_memo.setdefault('__craft_mitm_memo__', {})
+                                    if leaf_memo is not None else None))
                     if g:
                         g = _dominance_swap_gear(
                             g, node_skill, _rl, character, log, session_uuid,
@@ -1365,9 +1367,22 @@ def _resolve_best_routes_exact(nodes, global_settings, session_data, character,
 
 
 # ── entry point ─────────────────────────────────────────────────────────────
-def _exact_solve_context(session_uuid, global_settings, session_data, ui_config, log):
+def _exact_solve_context(session_uuid, global_settings, session_data, ui_config, log,
+                         leaf_memo=None):
     """Shared per-solve setup: optimizer helpers, reconstructed character, game
-    data, pet/consumable pools and the hidden-items set."""
+    data, pet/consumable pools and the hidden-items set. Cached on `leaf_memo`
+    when provided (run-scoped to a constant character + ui_config) so repeated
+    root-only quality re-solves skip reconstructing Character from JSON."""
+    _ctx_key = None
+    if leaf_memo is not None:
+        _ctx_key = (
+            bool((global_settings or {}).get('optimize_pets')),
+            bool((global_settings or {}).get('optimize_consumables')),
+            bool((global_settings or {}).get('use_pet_ability', True)),
+        )
+        _hit = leaf_memo.setdefault('__exact_ctx__', {}).get(_ctx_key)
+        if _hit is not None:
+            return _hit
     from ui.crafting_tree import (_get_gear_stats, _calculate_steps_per_action,
                                   _load_game_data)
     from util.gearset_utils import encode_gearset
@@ -1401,7 +1416,10 @@ def _exact_solve_context(session_uuid, global_settings, session_data, ui_config,
     except Exception as _hi_err:  # noqa: BLE001
         log(f"  [ct-exact] hidden-items set build failed: {_hi_err!r}", session_uuid)
         hidden_items = set()
-    return helpers, character, game_data, pets_pool, consumables_pool, hidden_items
+    ctx = (helpers, character, game_data, pets_pool, consumables_pool, hidden_items)
+    if _ctx_key is not None:
+        leaf_memo['__exact_ctx__'][_ctx_key] = ctx
+    return ctx
 
 
 def optimize_tree_exact(session_uuid, nodes, global_settings, session_data,
@@ -1424,9 +1442,12 @@ def optimize_tree_exact(session_uuid, nodes, global_settings, session_data,
     if log is None:
         def log(*a, **k):
             pass
+    if leaf_memo is None:
+        leaf_memo = {}
     (helpers, character, game_data, pets_pool, consumables_pool,
      hidden_items) = _exact_solve_context(session_uuid, global_settings,
-                                          session_data, ui_config, log)
+                                          session_data, ui_config, log,
+                                          leaf_memo=leaf_memo)
 
     t_all = time.perf_counter()
     resolutions = []
@@ -1478,7 +1499,8 @@ def optimize_root_only(session_uuid, nodes, global_settings, session_data,
         return None
     (helpers, character, _game_data, pets_pool, consumables_pool,
      hidden_items) = _exact_solve_context(session_uuid, global_settings,
-                                          session_data, ui_config, log)
+                                          session_data, ui_config, log,
+                                          leaf_memo=leaf_memo)
     gc = root.setdefault('gear_config', {})
     gc.pop('optimized_export', None)
     seed.pop(root_id, None)
